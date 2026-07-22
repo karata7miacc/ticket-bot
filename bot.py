@@ -254,6 +254,9 @@ ALTER TABLE tickets ADD COLUMN IF NOT EXISTS forwarded_by BIGINT NULL;
 -- proof, so an uploaded attachment is treated as proof (→ forward to owner).
 ALTER TABLE tickets ADD COLUMN IF NOT EXISTS awaiting_proof BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE tickets ADD COLUMN IF NOT EXISTS checkout_method TEXT NULL;
+-- Kill-switch: when TRUE, all AI automation (intake, shopping, proof auto-forward)
+-- is off for this ticket so staff can take over manually.
+ALTER TABLE tickets ADD COLUMN IF NOT EXISTS ai_disabled BOOLEAN NOT NULL DEFAULT FALSE;
 
 -- Record of every account released, so a SellAuth order can never be used twice.
 CREATE TABLE IF NOT EXISTS deliveries (
@@ -2045,6 +2048,37 @@ async def unforward_command(interaction: discord.Interaction):
     await interaction.followup.send(msg, ephemeral=True)
 
 
+@bot.tree.command(name="ai",
+                  description="Turn the AI assistant on/off for THIS ticket (kill-switch to take over).")
+@staff_only()
+@app_commands.describe(state="Turn the AI off to take over manually, or back on")
+@app_commands.choices(state=[
+    app_commands.Choice(name="off (staff take over)", value="off"),
+    app_commands.Choice(name="on (resume AI)", value="on"),
+])
+async def ai_command(interaction: discord.Interaction, state: app_commands.Choice[str]):
+    if not interaction.guild or not isinstance(interaction.channel, discord.TextChannel):
+        await interaction.response.send_message("Use this in a ticket channel.", ephemeral=True)
+        return
+    row = await db_fetchrow("SELECT 1 FROM tickets WHERE channel_id=$1", interaction.channel.id)
+    if not row:
+        await interaction.response.send_message("This is not a ticket channel.", ephemeral=True)
+        return
+    disabled = state.value == "off"
+    await db_execute(
+        "UPDATE tickets SET ai_disabled=$1 WHERE channel_id=$2",
+        disabled, interaction.channel.id)
+    if disabled:
+        await interaction.response.send_message(
+            "🤖 AI turned **off** for this ticket — staff have taken over.", ephemeral=True)
+        await interaction.channel.send(
+            f"🤖 The assistant has been switched off by {interaction.user.mention} — "
+            "a staff member will help you from here.")
+    else:
+        await interaction.response.send_message(
+            "🤖 AI turned **back on** for this ticket.", ephemeral=True)
+
+
 @bot.tree.command(name="rename", description="Rename the current ticket channel.")
 @staff_only()
 @app_commands.describe(text="New channel name")
@@ -2507,7 +2541,7 @@ class CryptoCheckView(discord.ui.View):
             await interaction.response.send_message("Use this inside the ticket.", ephemeral=True)
             return
         row = await db_fetchrow(
-            "SELECT crypto_payment_id, crypto_paid, owner_id FROM tickets WHERE channel_id=$1", ch.id)
+            "SELECT crypto_payment_id, crypto_paid, owner_id, ai_disabled FROM tickets WHERE channel_id=$1", ch.id)
         if not row or not row["crypto_payment_id"]:
             await interaction.response.send_message("No crypto payment is in progress here.", ephemeral=True)
             return
@@ -2534,8 +2568,10 @@ class CryptoCheckView(discord.ui.View):
                 color=0x2ECC71),
         )
         await maybe_fire_restock(ch)
-        # Owner always delivers → lock the customer and forward to the owner.
-        await forward_ticket_flow(ch, None)
+        # Owner always delivers → lock the customer and forward to the owner,
+        # unless staff have taken the ticket over via the AI kill-switch.
+        if not row["ai_disabled"]:
+            await forward_ticket_flow(ch, None)
 
 
 @bot.tree.command(name="crypto",
@@ -3739,7 +3775,7 @@ async def on_message(message: discord.Message):
 
     row = await db_fetchrow(
         """SELECT created_at, first_staff_response_seconds, status, kind, owner_id,
-                  ai_handled, claimed_by, forwarded_to_owner, awaiting_proof
+                  ai_handled, claimed_by, forwarded_to_owner, awaiting_proof, ai_disabled
            FROM tickets WHERE channel_id=$1""",
         message.channel.id
     )
@@ -3769,6 +3805,7 @@ async def on_message(message: discord.Message):
     if (
         row["status"] == "open"
         and not row["forwarded_to_owner"]
+        and not row["ai_disabled"]
         and is_member
         and not author_is_staff
         and message.author.id == int(row["owner_id"])
@@ -3795,6 +3832,7 @@ async def on_message(message: discord.Message):
         and row["kind"] == "claim"
         and not row["ai_handled"]
         and not row["forwarded_to_owner"]
+        and not row["ai_disabled"]
         and is_member
         and not author_is_staff
         and message.author.id == int(row["owner_id"])
@@ -3816,6 +3854,7 @@ async def on_message(message: discord.Message):
         and row["kind"] == "custom"
         and row["claimed_by"] is None
         and not row["forwarded_to_owner"]
+        and not row["ai_disabled"]
         and is_member
         and not author_is_staff
         and message.author.id == int(row["owner_id"])
