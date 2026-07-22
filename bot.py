@@ -31,6 +31,10 @@ DATABASE_URL = os.getenv("DATABASE_URL", "")
 
 GUILD_ID = int(os.getenv("GUILD_ID", "0") or "0")
 STAFF_ROLE_ID = int(os.getenv("STAFF_ROLE_ID", "0") or "0")
+# The shop owner: tickets can be escalated ("forwarded") to this role, after
+# which the customer is locked out and the owner sends the final logins.
+# Falls back to the server owner / admins if unset.
+OWNER_ROLE_ID = int(os.getenv("OWNER_ROLE_ID", "0") or "0")
 
 CLAIM_CATEGORY_ID = int(os.getenv("CLAIM_CATEGORY_ID", "0") or "0")
 CUSTOM_CATEGORY_ID = int(os.getenv("CUSTOM_CATEGORY_ID", "0") or "0")
@@ -237,6 +241,8 @@ ALTER TABLE tickets ADD COLUMN IF NOT EXISTS restock_alerted BOOLEAN NOT NULL DE
 ALTER TABLE tickets ADD COLUMN IF NOT EXISTS crypto_payment_id TEXT NULL;
 ALTER TABLE tickets ADD COLUMN IF NOT EXISTS crypto_amount NUMERIC NULL;
 ALTER TABLE tickets ADD COLUMN IF NOT EXISTS crypto_paid BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE tickets ADD COLUMN IF NOT EXISTS forwarded_to_owner BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE tickets ADD COLUMN IF NOT EXISTS forwarded_by BIGINT NULL;
 
 -- Record of every account released, so a SellAuth order can never be used twice.
 CREATE TABLE IF NOT EXISTS deliveries (
@@ -977,12 +983,31 @@ def get_staff_role(guild: discord.Guild) -> discord.Role | None:
     return guild.get_role(STAFF_ROLE_ID) if STAFF_ROLE_ID else None
 
 
+def get_owner_role(guild: discord.Guild) -> discord.Role | None:
+    return guild.get_role(OWNER_ROLE_ID) if OWNER_ROLE_ID else None
+
+
+def is_owner_member(member: discord.Member) -> bool:
+    """True for the shop owner: the dedicated owner role if configured,
+    otherwise the server owner / administrators."""
+    if member.guild and member.id == member.guild.owner_id:
+        return True
+    role = get_owner_role(member.guild)
+    if role is not None:
+        return role in member.roles
+    # No owner role configured → admins act as the owner.
+    return member.guild_permissions.administrator
+
+
 def is_staff(member: discord.Member) -> bool:
     # Server owner and administrators always count as staff so the bot
     # owner is never locked out, even without the explicit staff role.
     if member.guild and member.id == member.guild.owner_id:
         return True
     if member.guild_permissions.administrator:
+        return True
+    # The shop owner has every staff privilege (delivering, closing, etc.).
+    if is_owner_member(member):
         return True
     role = get_staff_role(member.guild)
     return (role in member.roles) if role else False
@@ -1083,6 +1108,143 @@ def ticket_embed(
     e.set_thumbnail(url=logo_ref())
     e.set_footer(text=footer_text or "AF SERVICES")
     return e
+
+
+def make_proof_checklist_embed(kind: str) -> discord.Embed:
+    """Shown to the customer on open so they know exactly what to provide before
+    staff can forward the ticket to the owner for the final hand-off."""
+    if kind == "claim":
+        e = discord.Embed(
+            title="📋  Before we can process your claim",
+            description=(
+                "To verify your order and hand it off for delivery, please provide the "
+                "following. Staff will review, then forward the ticket to the owner who "
+                "releases your account.\n" + DIVIDER
+            ),
+            color=AF_BLUE,
+        )
+        e.add_field(name="1️⃣ Proof of payment",
+                    value="Your **order ID / invoice ID** (preferred) or a screenshot of the "
+                          "payment & confirmation email.", inline=False)
+        e.add_field(name="2️⃣ What you bought",
+                    value="The **product name** exactly as listed at checkout.", inline=False)
+        e.add_field(name="3️⃣ Requirements met",
+                    value="Confirm you've followed everything in the account's **description / "
+                          "listing requirements**.", inline=False)
+    else:  # support / replacement
+        e = discord.Embed(
+            title="📋  Before we can process your replacement / issue",
+            description=(
+                "So we can verify eligibility and hand off to the owner, please provide the "
+                "following.\n" + DIVIDER
+            ),
+            color=AF_BLUE,
+        )
+        e.add_field(name="1️⃣ Proof of purchase",
+                    value="Your original **order ID** or purchase proof.", inline=False)
+        e.add_field(name="2️⃣ The issue",
+                    value="Describe the problem clearly (what happened, when).", inline=False)
+        e.add_field(name="3️⃣ Requirements followed",
+                    value="Proof you followed the account's **description / warranty "
+                          "requirements** (e.g. didn't change the email, secured it as instructed).",
+                    inline=False)
+    e.set_author(name="AF SERVICES • Verification")
+    e.set_thumbnail(url=logo_ref())
+    e.set_footer(text="Staff will review your proof, then forward this ticket to the owner.")
+    return e
+
+
+# ============================================================
+# FORWARD-TO-OWNER FLOW
+# ============================================================
+async def forward_ticket_flow(
+    channel: discord.TextChannel,
+    forwarded_by: discord.Member,
+) -> tuple[bool, str]:
+    """Escalate a ticket to the shop owner: lock the customer out of typing, grant
+    the owner access, and ping them to send the final logins. Staff can still type.
+    Returns (ok, ephemeral_status_message)."""
+    row = await db_fetchrow(
+        "SELECT owner_id, kind, status, forwarded_to_owner FROM tickets WHERE channel_id=$1",
+        channel.id,
+    )
+    if not row:
+        return False, "This is not a ticket channel."
+    if row["status"] != "open":
+        return False, "This ticket isn't open."
+    if row["forwarded_to_owner"]:
+        return False, "This ticket has already been forwarded to the owner."
+
+    owner_role = get_owner_role(channel.guild)
+    customer = channel.guild.get_member(int(row["owner_id"]))
+
+    # Lock the customer out of typing (they can still read the channel).
+    if customer is not None:
+        try:
+            await channel.set_permissions(
+                customer,
+                overwrite=discord.PermissionOverwrite(
+                    view_channel=True, send_messages=False, read_message_history=True),
+                reason="Ticket forwarded to owner — customer locked",
+            )
+        except Exception as e:
+            print("Customer lock failed:", e)
+
+    # Make sure the owner role can see and write in the ticket.
+    if owner_role is not None:
+        try:
+            await channel.set_permissions(
+                owner_role,
+                overwrite=discord.PermissionOverwrite(
+                    view_channel=True, send_messages=True, read_message_history=True),
+                reason="Ticket forwarded to owner",
+            )
+        except Exception as e:
+            print("Owner grant failed:", e)
+
+    await db_execute(
+        "UPDATE tickets SET forwarded_to_owner=TRUE, forwarded_by=$1, "
+        "last_footer_text=$2, last_activity=NOW() WHERE channel_id=$3",
+        forwarded_by.id, "AF SERVICES • Forwarded to owner", channel.id,
+    )
+    try:
+        await refresh_ticket_control_message(channel)
+    except Exception:
+        pass
+
+    is_replacement = row["kind"] in ("support",)
+    action_line = (
+        "send the **replacement logins** to the customer."
+        if is_replacement else
+        "release the **account / logins** to the customer."
+    )
+    ping = owner_role.mention if owner_role else (
+        f"<@{channel.guild.owner_id}>" if channel.guild.owner_id else "@owner"
+    )
+    customer_mention = customer.mention if customer else f"<@{int(row['owner_id'])}>"
+
+    e = discord.Embed(
+        title="📨  Ticket Forwarded to Owner",
+        description=(
+            f"{forwarded_by.mention} reviewed this ticket and forwarded it to the owner.\n\n"
+            f"**Customer:** {customer_mention} — now **locked** (read-only).\n"
+            f"**Owner:** please review the proof above and {action_line}"
+        ),
+        color=0x9B59B6,
+    )
+    e.set_thumbnail(url=logo_ref())
+    e.set_footer(text="AF SERVICES • Owner hand-off")
+    await channel.send(content=ping, embed=e)
+
+    log_ch = await get_log_channel(channel.guild)
+    if log_ch:
+        le = discord.Embed(title="📨 Ticket Forwarded to Owner", color=0x9B59B6)
+        le.add_field(name="Ticket", value=channel.mention, inline=False)
+        le.add_field(name="Forwarded by", value=forwarded_by.mention, inline=True)
+        le.add_field(name="Customer", value=customer_mention, inline=True)
+        await log_ch.send(embed=le)
+
+    return True, "✅ Ticket forwarded to the owner — the customer is now locked out of typing."
 
 
 # ============================================================
@@ -1222,6 +1384,10 @@ def cid_claim(channel_id: int) -> str:
     return f"af_claim:{channel_id}"
 
 
+def cid_forward(channel_id: int) -> str:
+    return f"af_forward:{channel_id}"
+
+
 # ============================================================
 # CLOSE MODAL
 # ============================================================
@@ -1291,8 +1457,33 @@ class TicketControlView(discord.ui.View):
         claim_btn.callback = self._claim_callback
         self.add_item(claim_btn)
 
+        forward_btn = discord.ui.Button(
+            label="Forward to Owner",
+            style=discord.ButtonStyle.primary,
+            emoji="📨",
+            custom_id=cid_forward(channel_id),
+        )
+        forward_btn.callback = self._forward_callback
+        self.add_item(forward_btn)
+
     async def _close_callback(self, interaction: discord.Interaction):
         await interaction.response.send_modal(CloseReasonModal(self.channel_id))
+
+    async def _forward_callback(self, interaction: discord.Interaction):
+        if not interaction.guild or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("Invalid context.", ephemeral=True)
+            return
+        if not is_staff(interaction.user):
+            await interaction.response.send_message(
+                "Only staff can forward tickets to the owner.", ephemeral=True)
+            return
+        ch = interaction.guild.get_channel(self.channel_id)
+        if not isinstance(ch, discord.TextChannel):
+            await interaction.response.send_message("Ticket channel not found.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        ok, msg = await forward_ticket_flow(ch, interaction.user)
+        await interaction.followup.send(msg, ephemeral=True)
 
     async def _claim_callback(self, interaction: discord.Interaction):
         if not interaction.guild or not isinstance(interaction.user, discord.Member):
@@ -1426,6 +1617,10 @@ class TicketPanelSelect(discord.ui.Select):
 
         if kind == "custom" and AI_ENABLED:
             await channel.send(embed=make_buy_intro_embed())
+        elif kind in ("claim", "support"):
+            # Tell the customer up front what proof they must provide so staff can
+            # verify and forward the ticket to the owner for the final hand-off.
+            await channel.send(embed=make_proof_checklist_embed(kind))
 
         await interaction.response.send_message(f"✅ Ticket created: {channel.mention}", ephemeral=True)
 
@@ -1501,6 +1696,19 @@ async def close_command(interaction: discord.Interaction, reason: str):
         closed_by=f"{interaction.user} ({interaction.user.id})",
         reason=reason,
     )
+
+
+@bot.tree.command(name="forward",
+                  description="Forward this ticket to the owner (locks the customer, owner sends logins).")
+@staff_only()
+async def forward_command(interaction: discord.Interaction):
+    if not interaction.guild or not isinstance(interaction.channel, discord.TextChannel) \
+            or not isinstance(interaction.user, discord.Member):
+        await interaction.response.send_message("Use this in a ticket channel.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    ok, msg = await forward_ticket_flow(interaction.channel, interaction.user)
+    await interaction.followup.send(msg, ephemeral=True)
 
 
 @bot.tree.command(name="rename", description="Rename the current ticket channel.")
@@ -2999,7 +3207,8 @@ async def on_message(message: discord.Message):
         return
 
     row = await db_fetchrow(
-        """SELECT created_at, first_staff_response_seconds, status, kind, owner_id, ai_handled, claimed_by
+        """SELECT created_at, first_staff_response_seconds, status, kind, owner_id,
+                  ai_handled, claimed_by, forwarded_to_owner
            FROM tickets WHERE channel_id=$1""",
         message.channel.id
     )
@@ -3029,6 +3238,7 @@ async def on_message(message: discord.Message):
         and row["status"] == "open"
         and row["kind"] == "claim"
         and not row["ai_handled"]
+        and not row["forwarded_to_owner"]
         and is_member
         and not author_is_staff
         and message.author.id == int(row["owner_id"])
@@ -3049,6 +3259,7 @@ async def on_message(message: discord.Message):
         and row["status"] == "open"
         and row["kind"] == "custom"
         and row["claimed_by"] is None
+        and not row["forwarded_to_owner"]
         and is_member
         and not author_is_staff
         and message.author.id == int(row["owner_id"])
