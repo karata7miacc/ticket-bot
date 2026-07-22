@@ -143,6 +143,14 @@ anthropic_client = AsyncAnthropic(api_key=ANTHROPIC_API_KEY) if AI_ENABLED else 
 # Channels currently being processed by the AI, so two quick messages don't double-fire.
 ai_locks: set[int] = set()
 
+# --- Account delivery cooldown (per staff member) ---
+# A single staff member may release at most one account every
+# DELIVERY_COOLDOWN_SECONDS, so an accidental double-click or a rushed hand-out
+# can't fire twice back to back. Kept in memory (resets on restart, which is
+# fine — the cooldown is only meant to smooth out rapid-fire deliveries).
+DELIVERY_COOLDOWN_SECONDS = int(os.getenv("DELIVERY_COOLDOWN_SECONDS", "300") or "300")
+_staff_delivery_cooldown: dict[int, datetime] = {}
+
 
 def logo_ref() -> str:
     return AF_LOGO_URL or f"attachment://{LOGO_FILENAME}"
@@ -467,9 +475,22 @@ async def _lzt_get(path: str, params: dict | None = None) -> dict:
     return out
 
 
+def _spent_metric(category: str, item: dict) -> int:
+    """How much the previous owner spent on an account, in the game's currency:
+    Valorant → VP value of the skin inventory; Fortnite → V-Bucks spent in shop.
+    Used to rank market listings so the customer gets the richest account their
+    budget allows."""
+    if category.lower() == "valorant":
+        return int(item.get("riot_valorant_inventory_value") or 0)
+    return sum(int(item.get(f"fortnite_shop_{k}_cost") or 0)
+               for k in ("skins", "pickaxes", "dances", "gliders"))
+
+
 async def lzt_search_market(category: str, budget: float | None = None,
                             count: int = 3) -> dict:
-    """Search live LZT.market listings we can buy & resell, richest-first within budget.
+    """Search live LZT.market listings we can buy & resell within a budget, ranked
+    by how much the previous owner spent (VP for Valorant, V-Bucks for Fortnite) so
+    the customer gets the richest account their budget allows.
     `category` is 'valorant' or 'fortnite'. `budget` is the customer's max spend (EUR);
     we cap the source price at budget / RESALE_MULTIPLIER. Returns {ok, items, error}."""
     out = {"ok": False, "items": [], "error": None}
@@ -477,7 +498,7 @@ async def lzt_search_market(category: str, budget: float | None = None,
     if not slug:
         out["error"] = f"unknown category '{category}'"
         return out
-    params: dict = {"order_by": "price_to_down"}  # most expensive (richest) first
+    params: dict = {"order_by": "price_to_down"}  # pull the pricier (richer) listings first
     if budget and budget > 0:
         params["pmax"] = round(budget / RESALE_MULTIPLIER, 2)
     res = await _lzt_get(f"/{slug}", params)
@@ -485,6 +506,9 @@ async def lzt_search_market(category: str, budget: float | None = None,
         out["error"] = res["error"]
         return out
     items = (res["data"] or {}).get("items") or []
+    # Rank strictly by amount spent (highest VP / V-Bucks spent first), so within
+    # the budget we always surface the accounts with the most invested in them.
+    items.sort(key=lambda it: _spent_metric(category, it), reverse=True)
     out.update(ok=True, items=items[:max(1, min(count, 5))])
     return out
 
@@ -522,6 +546,42 @@ _FN_RARITY = {
 }
 
 
+def _valorant_skin_names(item: dict) -> list[str]:
+    """Best-effort list of Valorant skin names from an LZT item.
+    LZT exposes the skin list under a few different keys depending on the
+    endpoint, so try each and pull a readable name from every entry."""
+    def _name(entry) -> str | None:
+        if isinstance(entry, str):
+            return entry.strip() or None
+        if isinstance(entry, dict):
+            for k in ("title", "name", "localizedName", "displayName", "skin_name", "displayIcon"):
+                v = entry.get(k)
+                if isinstance(v, str) and v.strip():
+                    return v.strip()
+        return None
+
+    for key in ("valorantSkins", "valorant_skins", "riotValorantSkins",
+                "riot_valorant_skins", "valorantInventory", "valorant_inventory",
+                "riot_valorant_inventory"):
+        val = item.get(key)
+        entries = None
+        if isinstance(val, list):
+            entries = val
+        elif isinstance(val, dict):
+            # Some payloads nest the list under a 'skins'/'items' field.
+            for sub in ("skins", "items", "weaponSkins", "WeaponSkins"):
+                if isinstance(val.get(sub), list):
+                    entries = val[sub]
+                    break
+            if entries is None:
+                entries = list(val.values())
+        if entries:
+            names = [n for n in (_name(e) for e in entries) if n]
+            if names:
+                return names
+    return []
+
+
 def market_account_embed(category: str, item: dict, image_name: str | None = None) -> discord.Embed:
     """Customer-facing embed describing one account: stats + skins image + price.
     Never exposes the sourcing marketplace. `image_name` is an attachment:// filename."""
@@ -546,6 +606,16 @@ def market_account_embed(category: str, item: dict, image_name: str | None = Non
         e.add_field(name="🪙 VP Balance", value=f"{vp_wallet:,} VP", inline=True)
         e.add_field(name="🧍 Agents", value=str(agents), inline=True)
         e.add_field(name="🔪 Knives", value=str(knives), inline=True)
+        # List the actual skins on the account when the listing exposes them,
+        # so buyers see exactly what they're getting (not just a count/image).
+        skin_names = _valorant_skin_names(item)
+        if skin_names:
+            shown = skin_names[:20]
+            skin_list = "\n".join(f"🔫 {n}" for n in shown)
+            more = len(skin_names) - len(shown)
+            if more > 0:
+                skin_list += f"\n…and **{more}** more"
+            e.add_field(name="🎨 Skin List", value=skin_list[:1024], inline=False)
     else:  # fortnite
         skins = item.get("fortnite_skin_count") or 0
         vbucks = item.get("fortnite_balance") or 0
@@ -785,6 +855,21 @@ async def deliver_account(
 ) -> bool:
     """Pull credentials from LZT for the given item and deliver them into the ticket.
     Guards against re-using an order. Returns True on success."""
+    # Per-staff delivery cooldown: block a staff member from releasing another
+    # account until DELIVERY_COOLDOWN_SECONDS have passed since their last one.
+    if delivered_by:
+        last = _staff_delivery_cooldown.get(delivered_by)
+        if last is not None:
+            elapsed = (utcnow() - last).total_seconds()
+            if elapsed < DELIVERY_COOLDOWN_SECONDS:
+                remaining = int(DELIVERY_COOLDOWN_SECONDS - elapsed)
+                mins, secs = divmod(remaining, 60)
+                await channel.send(
+                    f"⏳ <@{delivered_by}> is on delivery cooldown — please wait "
+                    f"**{mins}m {secs:02d}s** before releasing another account."
+                )
+                return False
+
     if order_id and await order_already_delivered(order_id):
         await channel.send("⚠️ That order has already been used for a delivery — staff will review.")
         return False
@@ -834,6 +919,11 @@ async def deliver_account(
         await post_purchase_followup(channel, owner, product or creds.get("title"), creds.get("title"))
     except Exception as e:
         print("post-purchase guide failed:", e)
+
+    # Start the staff member's cooldown only after a successful release, so a
+    # failed attempt (bad item id, etc.) never locks them out.
+    if delivered_by:
+        _staff_delivery_cooldown[delivered_by] = utcnow()
     return True
 
 
@@ -1056,13 +1146,15 @@ async def send_transcript_txt(
     close_reason: str,
     closed_by: str,
     claimed_by: str,
+    data: bytes | None = None,
 ) -> bool:
     log_ch = await get_log_channel(guild)
     if not log_ch:
         return False
 
     try:
-        data = await build_formatted_transcript(ticket_channel)
+        if data is None:
+            data = await build_formatted_transcript(ticket_channel)
         f = discord.File(io.BytesIO(data), filename=f"{ticket_channel.name}.txt")
         await log_ch.send(
             content=(
@@ -1077,6 +1169,42 @@ async def send_transcript_txt(
         return True
     except Exception as e:
         print("Transcript send failed:", e)
+        return False
+
+
+async def send_transcript_to_owner(
+    guild: discord.Guild,
+    ticket_channel: discord.TextChannel,
+    owner_id: int,
+    close_reason: str,
+    data: bytes,
+) -> bool:
+    """DM the person who opened the ticket a copy of its transcript on close."""
+    owner = guild.get_member(owner_id)
+    if owner is None:
+        try:
+            owner = await bot.fetch_user(owner_id)
+        except Exception:
+            return False
+    try:
+        f = discord.File(io.BytesIO(data), filename=f"{ticket_channel.name}.txt")
+        e = discord.Embed(
+            title="🧾  Your Ticket Transcript",
+            description=(
+                f"Your ticket **`{ticket_channel.name}`** has been closed.\n"
+                f"A full transcript is attached for your records.\n\n"
+                f"**Reason:** {close_reason}"
+            ),
+            color=AF_BLUE,
+        )
+        e.set_thumbnail(url=logo_ref())
+        e.set_footer(text="AF SERVICES • Thank you for reaching out")
+        await owner.send(embed=e, file=f)
+        return True
+    except discord.Forbidden:
+        return False
+    except Exception as ex:
+        print("Owner transcript DM failed:", ex)
         return False
 
 
@@ -1114,8 +1242,14 @@ class CloseReasonModal(discord.ui.Modal, title="Close Ticket"):
         if not interaction.guild or not isinstance(interaction.user, discord.Member):
             await interaction.response.send_message("Invalid context.", ephemeral=True)
             return
-        if not is_staff(interaction.user):
-            await interaction.response.send_message("Only staff can close tickets.", ephemeral=True)
+        # Staff can always close; the ticket owner may also close their own ticket.
+        ticket_row = await db_fetchrow(
+            "SELECT owner_id FROM tickets WHERE channel_id=$1", self.channel_id
+        )
+        is_owner = bool(ticket_row) and int(ticket_row["owner_id"]) == interaction.user.id
+        if not (is_staff(interaction.user) or is_owner):
+            await interaction.response.send_message(
+                "Only staff or the person who opened this ticket can close it.", ephemeral=True)
             return
 
         ch = interaction.guild.get_channel(self.channel_id)
@@ -1224,16 +1358,22 @@ class TicketPanelSelect(discord.ui.Select):
         user = interaction.user
         kind = self.values[0]
 
+        # One open ticket per person, across every category. They must close
+        # their current ticket before opening a new one of any kind.
         existing = await db_fetchrow(
-            "SELECT channel_id FROM tickets WHERE guild_id=$1 AND owner_id=$2 AND kind=$3 AND status='open'",
-            guild.id, user.id, kind
+            "SELECT channel_id FROM tickets WHERE guild_id=$1 AND owner_id=$2 AND status='open'",
+            guild.id, user.id
         )
         if existing:
             ch = guild.get_channel(int(existing["channel_id"]))
             if isinstance(ch, discord.TextChannel):
-                await interaction.response.send_message(f"You already have an open ticket: {ch.mention}", ephemeral=True)
+                await interaction.response.send_message(
+                    f"You already have an open ticket: {ch.mention}\n"
+                    "Please close it before opening another one.", ephemeral=True)
             else:
-                await interaction.response.send_message("You already have an open ticket.", ephemeral=True)
+                await interaction.response.send_message(
+                    "You already have an open ticket — please close it before opening another.",
+                    ephemeral=True)
             return
 
         cat_id = category_for_kind(kind)
@@ -1333,15 +1473,26 @@ async def ticket_panel(interaction: discord.Interaction):
 
 
 @bot.tree.command(name="close", description="Close the current ticket.")
-@staff_only()
 @app_commands.describe(reason="Reason for closing this ticket")
 async def close_command(interaction: discord.Interaction, reason: str):
     if not interaction.guild or not isinstance(interaction.channel, discord.TextChannel):
         await interaction.response.send_message("Use this in a ticket channel.", ephemeral=True)
         return
 
-    if not await is_ticket_channel(interaction.channel.id):
+    ticket_row = await db_fetchrow(
+        "SELECT owner_id FROM tickets WHERE channel_id=$1", interaction.channel.id
+    )
+    if not ticket_row:
         await interaction.response.send_message("This is not a ticket channel.", ephemeral=True)
+        return
+
+    # Staff can close any ticket; the ticket owner can close their own.
+    is_owner = isinstance(interaction.user, discord.Member) and \
+        int(ticket_row["owner_id"]) == interaction.user.id
+    is_staff_member = isinstance(interaction.user, discord.Member) and is_staff(interaction.user)
+    if not (is_owner or is_staff_member):
+        await interaction.response.send_message(
+            "Only staff or the person who opened this ticket can close it.", ephemeral=True)
         return
 
     await interaction.response.send_message("Closing ticket...", ephemeral=True)
@@ -1627,9 +1778,10 @@ async def market_command(interaction: discord.Interaction, category: app_command
         if file:
             files.append(file)
 
-    header = f"🛍️ **{category.name} accounts available**"
+    spent_label = "VP spent" if category.value == "valorant" else "V-Bucks spent"
+    header = f"🛍️ **{category.name} accounts available** — highest **{spent_label}** first"
     if budget:
-        header += f" — within a **€{budget:.0f}** budget"
+        header += f", within a **€{budget:.0f}** budget"
     await interaction.followup.send(content=header, embeds=embeds[:10], files=files)
 
 
@@ -2758,7 +2910,7 @@ async def refresh_ticket_control_message(channel: discord.TextChannel):
 # ============================================================
 async def close_ticket_flow(channel: discord.TextChannel, closed_by: str, reason: str):
     row = await db_fetchrow(
-        "SELECT status, claimed_by FROM tickets WHERE channel_id=$1",
+        "SELECT status, claimed_by, owner_id FROM tickets WHERE channel_id=$1",
         channel.id,
     )
     if not row or row["status"] != "open":
@@ -2774,20 +2926,45 @@ async def close_ticket_flow(channel: discord.TextChannel, closed_by: str, reason
         claimer = channel.guild.get_member(int(row["claimed_by"]))
         claimed_by = f"{claimer} ({claimer.id})" if claimer else str(int(row["claimed_by"]))
 
+    # Build the transcript once, then send it to the staff log AND DM it to the
+    # person who opened the ticket so they keep their own copy.
+    transcript_data: bytes | None = None
+    try:
+        transcript_data = await build_formatted_transcript(channel)
+    except Exception as e:
+        print("Transcript build failed:", e)
+
     transcript_sent = await send_transcript_txt(
         guild=channel.guild,
         ticket_channel=channel,
         close_reason=reason,
         closed_by=closed_by,
         claimed_by=claimed_by,
+        data=transcript_data,
     )
 
+    owner_transcript_sent = False
+    if transcript_data is not None:
+        owner_transcript_sent = await send_transcript_to_owner(
+            guild=channel.guild,
+            ticket_channel=channel,
+            owner_id=int(row["owner_id"]),
+            close_reason=reason,
+            data=transcript_data,
+        )
+
+    owner_line = (
+        "📨 Transcript sent to you via DM."
+        if owner_transcript_sent
+        else "ℹ️ Couldn't DM you the transcript (check your DM privacy settings)."
+    )
     base = (
         f"🔒 **Ticket Closed**\n"
         f"Closed by: {closed_by}\n"
         f"Claimed by: {claimed_by}\n"
         f"Reason: {reason}\n"
-        f"{'✅ Transcript saved.' if transcript_sent else '⚠️ Transcript failed.'}\n\n"
+        f"{'✅ Transcript saved.' if transcript_sent else '⚠️ Transcript failed.'}\n"
+        f"{owner_line}\n\n"
         f"🗑️ Deleting in {DELETE_COUNTDOWN_SECONDS} seconds..."
     )
     countdown_msg = await channel.send(base)
