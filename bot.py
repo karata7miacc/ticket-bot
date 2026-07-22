@@ -71,8 +71,10 @@ AF_BANNER_URL = os.getenv("AF_BANNER_URL", "")  # optional direct-URL override
 # ============================================================
 # --- Claude (Anthropic) AI intake assistant ---
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-AI_MODEL = os.getenv("AI_MODEL", "claude-sonnet-4-6")  # set claude-opus-4-8 for max quality
+AI_MODEL = os.getenv("AI_MODEL", "claude-sonnet-5")  # set claude-opus-4-8 for max quality
 AI_ENABLED = bool(ANTHROPIC_API_KEY) and AsyncAnthropic is not None
+# Card payments carry a surcharge: customer pays account price × this multiplier.
+CARD_TAX_MULTIPLIER = float(os.getenv("CARD_TAX_MULTIPLIER", "1.20") or "1.20")
 
 # --- SellAuth (payment verification — the trusted proof) ---
 SELLAUTH_API_KEY = os.getenv("SELLAUTH_API_KEY", "")
@@ -146,6 +148,11 @@ CARD_PROOF_EMAIL_URL = os.getenv("CARD_PROOF_EMAIL_URL", "")
 anthropic_client = AsyncAnthropic(api_key=ANTHROPIC_API_KEY) if AI_ENABLED else None
 # Channels currently being processed by the AI, so two quick messages don't double-fire.
 ai_locks: set[int] = set()
+
+# AI shopping: the last set of accounts shown in a ticket, so a customer can
+# pick "the 2nd one" and we know which listing that maps to.
+# channel_id -> [{"item_id", "price", "title", "game"}], most recent shown first.
+shop_offers: dict[int, list[dict]] = {}
 
 # --- Account delivery cooldown (per staff member) ---
 # A single staff member may release at most one account every
@@ -243,6 +250,10 @@ ALTER TABLE tickets ADD COLUMN IF NOT EXISTS crypto_amount NUMERIC NULL;
 ALTER TABLE tickets ADD COLUMN IF NOT EXISTS crypto_paid BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE tickets ADD COLUMN IF NOT EXISTS forwarded_to_owner BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE tickets ADD COLUMN IF NOT EXISTS forwarded_by BIGINT NULL;
+-- AI checkout: set when the customer is expected to upload payment/replacement
+-- proof, so an uploaded attachment is treated as proof (→ forward to owner).
+ALTER TABLE tickets ADD COLUMN IF NOT EXISTS awaiting_proof BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE tickets ADD COLUMN IF NOT EXISTS checkout_method TEXT NULL;
 
 -- Record of every account released, so a SellAuth order can never be used twice.
 CREATE TABLE IF NOT EXISTS deliveries (
@@ -1413,11 +1424,12 @@ def make_proof_checklist_embed(kind: str) -> discord.Embed:
 # ============================================================
 async def forward_ticket_flow(
     channel: discord.TextChannel,
-    forwarded_by: discord.Member,
+    forwarded_by: discord.Member | None,
 ) -> tuple[bool, str]:
     """Escalate a ticket to the shop owner: lock the customer out of typing, grant
     the owner access, and ping them to send the final logins. Staff can still type.
-    Returns (ok, ephemeral_status_message)."""
+    `forwarded_by` is the staff member who forwarded, or None when the AI assistant
+    forwards automatically. Returns (ok, ephemeral_status_message)."""
     row = await db_fetchrow(
         "SELECT owner_id, kind, status, forwarded_to_owner FROM tickets WHERE channel_id=$1",
         channel.id,
@@ -1459,7 +1471,8 @@ async def forward_ticket_flow(
     await db_execute(
         "UPDATE tickets SET forwarded_to_owner=TRUE, forwarded_by=$1, "
         "last_footer_text=$2, last_activity=NOW() WHERE channel_id=$3",
-        forwarded_by.id, "AF SERVICES • Forwarded to owner", channel.id,
+        (forwarded_by.id if forwarded_by else None),
+        "AF SERVICES • Forwarded to owner", channel.id,
     )
     try:
         await refresh_ticket_control_message(channel)
@@ -1476,11 +1489,12 @@ async def forward_ticket_flow(
         f"<@{channel.guild.owner_id}>" if channel.guild.owner_id else "@owner"
     )
     customer_mention = customer.mention if customer else f"<@{int(row['owner_id'])}>"
+    actor = forwarded_by.mention if forwarded_by else "The assistant"
 
     e = discord.Embed(
         title="📨  Ticket Forwarded to Owner",
         description=(
-            f"{forwarded_by.mention} reviewed this ticket and forwarded it to the owner.\n\n"
+            f"{actor} forwarded this ticket to the owner.\n\n"
             f"**Customer:** {customer_mention} — now **locked** (read-only).\n"
             f"**Owner:** please review the proof above and {action_line}"
         ),
@@ -1494,7 +1508,7 @@ async def forward_ticket_flow(
     if log_ch:
         le = discord.Embed(title="📨 Ticket Forwarded to Owner", color=0x9B59B6)
         le.add_field(name="Ticket", value=channel.mention, inline=False)
-        le.add_field(name="Forwarded by", value=forwarded_by.mention, inline=True)
+        le.add_field(name="Forwarded by", value=actor, inline=True)
         le.add_field(name="Customer", value=customer_mention, inline=True)
         await log_ch.send(embed=le)
 
@@ -2510,18 +2524,18 @@ class CryptoCheckView(discord.ui.View):
                 f"⏳ Not confirmed yet (status: `{st['status']}`). Give it a minute and check again.",
                 ephemeral=True)
             return
-        await db_execute("UPDATE tickets SET crypto_paid=TRUE WHERE channel_id=$1", ch.id)
+        await db_execute("UPDATE tickets SET crypto_paid=TRUE, awaiting_proof=FALSE WHERE channel_id=$1", ch.id)
         await interaction.followup.send("✅ Payment confirmed — thank you!", ephemeral=True)
         owner = ch.guild.get_member(int(row["owner_id"])) or await bot.fetch_user(int(row["owner_id"]))
-        staff_role = get_staff_role(ch.guild)
         await ch.send(
-            content=(staff_role.mention if staff_role else None),
             embed=discord.Embed(
                 title="✅  Crypto Payment Confirmed",
-                description=f"{owner.mention}'s crypto payment is confirmed. Staff will deliver shortly.",
+                description=f"{owner.mention}'s crypto payment is confirmed. Handing off to the owner to deliver.",
                 color=0x2ECC71),
         )
         await maybe_fire_restock(ch)
+        # Owner always delivers → lock the customer and forward to the owner.
+        await forward_ticket_flow(ch, None)
 
 
 @bot.tree.command(name="crypto",
@@ -2558,18 +2572,7 @@ async def crypto_command(interaction: discord.Interaction, amount: float | None 
     if not price or price <= 0:
         await interaction.followup.send("Couldn't determine a price.", ephemeral=True)
         return
-    await db_execute(
-        "UPDATE tickets SET crypto_amount=$1, crypto_payment_id=NULL, crypto_paid=FALSE WHERE channel_id=$2",
-        price, interaction.channel.id)
-    e = discord.Embed(
-        title="💳  Pay with Crypto",
-        description=(f"**Total: €{price:.2f}**\n\nChoose a coin below to get your payment address.\n"
-                     f"We accept **LTC, SOL, BTC, ETH**.\n{DIVIDER}"),
-        color=AF_BLUE,
-    )
-    e.set_thumbnail(url=logo_ref())
-    e.set_footer(text="AF SERVICES • Crypto Checkout")
-    await interaction.channel.send(embed=e, view=CryptoPayView(), files=embed_files())
+    await post_crypto_checkout(interaction.channel, price)
     await interaction.followup.send("✅ Crypto checkout posted.", ephemeral=True)
 
 
@@ -3343,20 +3346,143 @@ def make_buy_intro_embed() -> discord.Embed:
     return e
 
 
+# ---- AI checkout helpers ----------------------------------------------------
+async def reserve_market_item(channel: discord.TextChannel, item: dict) -> tuple[int, float]:
+    """Reserve a market listing to this ticket. Returns (item_id, resale_price)."""
+    iid = int(_account_item_id(item) or 0)
+    _, resale = _resale_price(item)
+    await db_execute(
+        "UPDATE tickets SET reserved_market_item_id=$1, restock_alerted=FALSE WHERE channel_id=$2",
+        iid, channel.id)
+    return iid, resale
+
+
+async def post_crypto_checkout(channel: discord.TextChannel, price: float) -> None:
+    """Post the crypto (NowPayments) checkout for `price` EUR into the ticket."""
+    await db_execute(
+        "UPDATE tickets SET crypto_amount=$1, crypto_payment_id=NULL, crypto_paid=FALSE, "
+        "checkout_method='crypto' WHERE channel_id=$2",
+        price, channel.id)
+    e = discord.Embed(
+        title="💳  Pay with Crypto",
+        description=(f"**Total: €{price:.2f}**\n\nChoose a coin below to get your payment address.\n"
+                     f"We accept **LTC, SOL, BTC, ETH**.\n{DIVIDER}"),
+        color=AF_BLUE,
+    )
+    e.set_thumbnail(url=logo_ref())
+    e.set_footer(text="AF SERVICES • Crypto Checkout")
+    await channel.send(embed=e, view=CryptoPayView(), files=embed_files())
+
+
+async def post_card_checkout(channel: discord.TextChannel, account_price: float) -> None:
+    """Post the card guide + the amount to pay (account price × card tax)."""
+    total = account_price * CARD_TAX_MULTIPLIER
+    pct = int(round((CARD_TAX_MULTIPLIER - 1) * 100))
+    await db_execute(
+        "UPDATE tickets SET awaiting_proof=TRUE, checkout_method='card' WHERE channel_id=$1",
+        channel.id)
+    await channel.send(embeds=make_card_embeds(), view=CardView(),
+                       files=embed_files() + card_proof_files())
+    e = discord.Embed(
+        title="💳  Card Payment — Amount to Pay",
+        description=(
+            f"Account price: **€{account_price:.2f}**\n"
+            f"Card fee (**+{pct}%**) included\n"
+            f"**Total to pay by card: €{total:.2f}**\n\n"
+            f"Follow the guide above, then **upload a screenshot of your payment and the "
+            f"confirmation email** right here. Once you do, I'll pass your order to the owner "
+            f"to finalize. 🙏"),
+        color=AF_BLUE,
+    )
+    e.set_footer(text="AF SERVICES • Card Checkout")
+    await channel.send(embed=e)
+
+
+async def present_accounts(channel: discord.TextChannel, game: str, budget: float | None,
+                           wanted: list[str], count: int = 3) -> int:
+    """Search, filter, and post matching accounts; remember them for selection.
+    Returns how many were shown."""
+    pool = 20 if wanted else count
+    res = await lzt_search_market(game, budget=budget, count=count, pool=pool)
+    if not res["ok"]:
+        await channel.send(f"⚠️ I couldn't reach the stock right now (`{res['error']}`). "
+                           f"A staff member will help you shortly.")
+        return 0
+    chosen: list[dict] = []
+    scanned = 0
+    for it in res["items"]:
+        if len(chosen) >= count or scanned >= 20:
+            break
+        det = await lzt_item_detail(it.get("item_id") or it.get("id"))
+        scanned += 1
+        item = det["item"] if det["ok"] else it
+        if wanted:
+            sections = await build_cosmetic_sections(game, item)
+            owned = [n.lower() for names in sections.values() for n in names]
+            if not all(any(w.lower() in n for n in owned) for w in wanted):
+                continue
+        chosen.append(item)
+    if not chosen:
+        extra = f" matching {', '.join(wanted)}" if wanted else ""
+        await channel.send(
+            f"I couldn't find a {game.title()} account{extra} within that budget right now. "
+            f"Try a higher budget or different skins, or a staff member can source one for you.")
+        return 0
+
+    embeds, files, offers = [], [], []
+    for i, item in enumerate(chosen):
+        embed, file = await build_account_message(game, item, i)
+        embed.title = f"#{i + 1} • {embed.title}"  # number for easy selection
+        embeds.append(embed)
+        if file:
+            files.append(file)
+        iid = int(_account_item_id(item) or 0)
+        _, price = _resale_price(item)
+        offers.append({"item_id": iid, "price": price,
+                       "title": item.get("title") or "Account", "game": game})
+    shop_offers[channel.id] = offers
+
+    view = skins_view_for(chosen, game)
+    kwargs = {
+        "content": "Here are the best matches 👇 Reply with the **number** of the one you want, "
+                   "or ask me to adjust the budget/skins.",
+        "embeds": embeds[:10], "files": files,
+    }
+    if view is not None:
+        kwargs["view"] = view
+    await channel.send(**kwargs)
+    return len(offers)
+
+
 AI_SHOP_PROMPT = (
-    "You are the shopping assistant for AF SERVICES, a Discord shop that sells gaming accounts. "
-    "You are talking to a customer in a ticket who wants to browse and buy an account. "
-    "We ONLY stock two games: Valorant and Fortnite. "
-    "Your job: figure out (1) which game they want and (2) their budget in EUR. "
-    "If they mention a game we don't carry, politely say we only have Valorant and Fortnite. "
-    "If you don't yet know the game or budget, ask for the missing piece in a warm, brief way, "
-    "and give a quick example of how to phrase it. "
-    "When you have BOTH a game (valorant or fortnite) and a numeric EUR budget, set ready=true — "
-    "the system will then automatically show matching accounts, so your reply should tell them "
-    "you're pulling up options now (do NOT invent account details or prices yourself).\n\n"
-    "Respond with ONLY a JSON object, no prose around it:\n"
-    '{"reply": "<your message>", "game": <"valorant"|"fortnite"|null>, '
-    '"budget": <number|null>, "ready": <true only when you have BOTH game and budget>}'
+    "You are the shopping assistant for AF SERVICES, a Discord shop that sells Valorant and "
+    "Fortnite accounts. You talk to a customer in their ticket and drive the whole flow: "
+    "understand what they want, show accounts, take their pick, and start checkout. We ONLY "
+    "stock Valorant and Fortnite — politely decline anything else.\n\n"
+    "IMPORTANT RULES:\n"
+    "- NEVER invent account details, skins, or prices. The system shows real accounts.\n"
+    "- NEVER reveal or promise account logins/credentials — the OWNER always delivers those "
+    "after payment. You only take the order up to payment/proof.\n"
+    "- Card payments include a surcharge; the system computes the exact total — don't quote a "
+    "card total yourself, just say card has a small fee and let the system post it.\n"
+    "- Be warm, concise, human.\n\n"
+    "Each turn, respond with ONLY a JSON object (no prose around it):\n"
+    "{\n"
+    '  "reply": "<message to the customer>",\n'
+    '  "action": "none" | "search" | "select" | "checkout",\n'
+    '  "game": "valorant" | "fortnite" | null,\n'
+    '  "budget": <number|null>,          // EUR, for search\n'
+    '  "skins": [<string>, ...] | null,  // optional specific skins they asked for\n'
+    '  "index": <number|null>,           // which shown account they picked (1-based)\n'
+    '  "method": "crypto" | "card" | null // for checkout\n'
+    "}\n\n"
+    "Flow:\n"
+    "1. Missing game or budget → action \"none\", ask for it.\n"
+    "2. Have game + budget (and any skins) → action \"search\" (reply: tell them you're pulling options).\n"
+    "3. They pick one (e.g. 'the 2nd', '#1') → action \"select\" with index (reply: confirm the pick, "
+    "ask whether they want to pay by crypto or card).\n"
+    "4. They choose a method → action \"checkout\" with method (reply: tell them the checkout is below).\n"
+    "Only set action to search/select/checkout when that step is actually reached; otherwise \"none\"."
 )
 
 
@@ -3391,44 +3517,84 @@ async def run_ai_shopping(channel: discord.TextChannel, owner: discord.abc.User)
         return
 
     data = _extract_json(raw) or {}
-    reply = data.get("reply") or "What game and budget are you looking for?"
-    await channel.send(reply)
+    reply = data.get("reply")
+    if reply:
+        await channel.send(str(reply)[:1900])
 
-    game = (data.get("game") or "").lower()
-    budget = data.get("budget")
-    try:
-        budget = float(budget) if budget is not None else None
-    except (TypeError, ValueError):
-        budget = None
-    if not (data.get("ready") and game in LZT_MARKET_SLUGS and budget and budget > 0):
-        return
+    action = str(data.get("action") or "none").lower()
 
-    # Show matching accounts within budget (source price capped at budget / markup).
-    res = await lzt_search_market(game, budget=budget, count=3)
-    if not res["ok"]:
-        await channel.send(f"⚠️ I couldn't reach the stock right now (`{res['error']}`). "
-                           f"A staff member will help you shortly.")
-        return
-    if not res["items"]:
-        await channel.send(
-            f"I couldn't find a {game.title()} account within €{budget:.0f} right now. "
-            f"Try a higher budget, or a staff member can source one for you.")
-        return
+    def _num(v):
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
 
-    embeds, files = [], []
-    for i, it in enumerate(res["items"]):
-        det = await lzt_item_detail(it.get("item_id") or it.get("id"))
-        embed, file = await build_account_message(game, det["item"] if det["ok"] else it, i)
-        embeds.append(embed)
-        if file:
-            files.append(file)
-    await channel.send(
-        content=f"Here are the best **{game.title()}** accounts I found within **€{budget:.0f}** 👇",
-        embeds=embeds[:10],
-        files=files,
-    )
-    await channel.send("Let me know which one you'd like, or tell me to adjust the budget. "
-                       "A staff member will finalize your purchase.")
+    if action == "search":
+        game = str(data.get("game") or "").lower()
+        budget = _num(data.get("budget"))
+        wanted = [str(s).strip() for s in (data.get("skins") or []) if str(s).strip()]
+        if game in LZT_MARKET_SLUGS and budget and budget > 0:
+            await present_accounts(channel, game, budget, wanted)
+
+    elif action == "select":
+        offers = shop_offers.get(channel.id) or []
+        idx = data.get("index")
+        try:
+            idx = int(idx)
+        except (TypeError, ValueError):
+            idx = None
+        if offers and idx and 1 <= idx <= len(offers):
+            pick = offers[idx - 1]
+            det = await lzt_item_detail(pick["item_id"])
+            item = det["item"] if det["ok"] else {"price": pick["price"],
+                                                  "item_id": pick["item_id"]}
+            await reserve_market_item(channel, item)
+        else:
+            await channel.send("Which account would you like? Reply with its **number** "
+                               "(e.g. `1`).")
+
+    elif action == "checkout":
+        method = str(data.get("method") or "").lower()
+        row = await db_fetchrow(
+            "SELECT reserved_market_item_id FROM tickets WHERE channel_id=$1", channel.id)
+        if not row or not row["reserved_market_item_id"]:
+            await channel.send("First let me know which account you'd like, then we'll set up payment.")
+            return
+        det = await lzt_item_detail(row["reserved_market_item_id"])
+        if not det["ok"]:
+            await channel.send("Hmm, I couldn't load that account just now — a staff member will help.")
+            return
+        _, price = _resale_price(det["item"] or {})
+        if method == "crypto":
+            await post_crypto_checkout(channel, price)
+        elif method == "card":
+            await post_card_checkout(channel, price)
+        else:
+            await channel.send("Would you like to pay by **crypto** or **card**?")
+
+
+async def handle_proof_upload(message: discord.Message, kind: str) -> None:
+    """Customer uploaded proof (card-payment screenshot, or replacement evidence).
+    Acknowledge it and auto-forward the ticket to the owner (who does the final call).
+    Videos are acknowledged but not judged by the AI — the owner reviews them."""
+    ch = message.channel
+    if not isinstance(ch, discord.TextChannel):
+        return
+    has_video = any(
+        (a.content_type or "").startswith("video")
+        or a.filename.lower().endswith((".mp4", ".mov", ".webm", ".mkv", ".avi", ".m4v"))
+        for a in message.attachments)
+
+    if kind == "support":
+        ack = "📎 Thanks — I've received your video." if has_video else "📎 Thanks — I've received your proof."
+        detail = "The owner will review your replacement request now."
+    else:  # card payment proof (custom/buy)
+        ack = "📎 Thanks — I've received your payment proof."
+        detail = "The owner will verify your payment and deliver your account."
+
+    await ch.send(f"✅ {ack} Please **wait for the owner** — {detail} 🙏")
+    await db_execute("UPDATE tickets SET awaiting_proof=FALSE WHERE channel_id=$1", ch.id)
+    await forward_ticket_flow(ch, None)
 
 
 # ============================================================
@@ -3573,7 +3739,7 @@ async def on_message(message: discord.Message):
 
     row = await db_fetchrow(
         """SELECT created_at, first_staff_response_seconds, status, kind, owner_id,
-                  ai_handled, claimed_by, forwarded_to_owner
+                  ai_handled, claimed_by, forwarded_to_owner, awaiting_proof
            FROM tickets WHERE channel_id=$1""",
         message.channel.id
     )
@@ -3595,6 +3761,31 @@ async def on_message(message: discord.Message):
                 seconds, message.channel.id
             )
             await refresh_ticket_control_message(message.channel)
+
+    # Proof upload → acknowledge + auto-forward to the owner. Applies to the
+    # customer's own attachments in an open, not-yet-forwarded ticket:
+    #   • support (replacement) → any attachment counts as proof
+    #   • custom (buy) → only once a card checkout is awaiting proof
+    if (
+        row["status"] == "open"
+        and not row["forwarded_to_owner"]
+        and is_member
+        and not author_is_staff
+        and message.author.id == int(row["owner_id"])
+        and message.attachments
+        and message.channel.id not in ai_locks
+        and (row["kind"] == "support"
+             or (row["kind"] == "custom" and row["awaiting_proof"]))
+    ):
+        ai_locks.add(message.channel.id)
+        try:
+            await handle_proof_upload(message, row["kind"])
+        except Exception as e:
+            print("Proof handling failed:", e)
+        finally:
+            ai_locks.discard(message.channel.id)
+        await bot.process_commands(message)
+        return
 
     # AI intake: only in open claim tickets, only for the buyer's own messages,
     # and only until staff takes over (claimed) or an account is delivered.
