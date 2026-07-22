@@ -1501,6 +1501,59 @@ async def forward_ticket_flow(
     return True, "✅ Ticket forwarded to the owner — the customer is now locked out of typing."
 
 
+async def unforward_ticket_flow(
+    channel: discord.TextChannel,
+    unlocked_by: discord.Member,
+) -> tuple[bool, str]:
+    """Undo a forward: unlock the customer, clear the owner grant, and reset state.
+    Returns (ok, ephemeral_status_message)."""
+    row = await db_fetchrow(
+        "SELECT owner_id, status, forwarded_to_owner FROM tickets WHERE channel_id=$1",
+        channel.id,
+    )
+    if not row:
+        return False, "This is not a ticket channel."
+    if not row["forwarded_to_owner"]:
+        return False, "This ticket isn't currently forwarded to the owner."
+
+    customer = channel.guild.get_member(int(row["owner_id"]))
+    if customer is not None:
+        try:
+            await channel.set_permissions(
+                customer,
+                overwrite=discord.PermissionOverwrite(
+                    view_channel=True, send_messages=True, read_message_history=True),
+                reason="Ticket un-forwarded — customer unlocked",
+            )
+        except Exception as e:
+            print("Customer unlock failed:", e)
+
+    owner_role = get_owner_role(channel.guild)
+    if owner_role is not None:
+        try:
+            # Clear the explicit owner overwrite added on forward.
+            await channel.set_permissions(owner_role, overwrite=None,
+                                          reason="Ticket un-forwarded")
+        except Exception as e:
+            print("Owner overwrite clear failed:", e)
+
+    await db_execute(
+        "UPDATE tickets SET forwarded_to_owner=FALSE, forwarded_by=NULL, "
+        "last_footer_text=$1, last_activity=NOW() WHERE channel_id=$2",
+        "AF SERVICES", channel.id,
+    )
+    try:
+        await refresh_ticket_control_message(channel)
+    except Exception:
+        pass
+
+    customer_mention = customer.mention if customer else f"<@{int(row['owner_id'])}>"
+    await channel.send(
+        f"🔓 {unlocked_by.mention} un-forwarded this ticket — {customer_mention} can type again."
+    )
+    return True, "✅ Ticket un-forwarded — the customer can type again."
+
+
 # ============================================================
 # TRANSCRIPT
 # ============================================================
@@ -1962,6 +2015,19 @@ async def forward_command(interaction: discord.Interaction):
         return
     await interaction.response.defer(ephemeral=True)
     ok, msg = await forward_ticket_flow(interaction.channel, interaction.user)
+    await interaction.followup.send(msg, ephemeral=True)
+
+
+@bot.tree.command(name="unforward",
+                  description="Undo a forward: unlock the customer and reset the ticket.")
+@staff_only()
+async def unforward_command(interaction: discord.Interaction):
+    if not interaction.guild or not isinstance(interaction.channel, discord.TextChannel) \
+            or not isinstance(interaction.user, discord.Member):
+        await interaction.response.send_message("Use this in a ticket channel.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    ok, msg = await unforward_ticket_flow(interaction.channel, interaction.user)
     await interaction.followup.send(msg, ephemeral=True)
 
 
