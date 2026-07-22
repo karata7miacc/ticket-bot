@@ -493,12 +493,14 @@ def _spent_metric(category: str, item: dict) -> int:
 
 
 async def lzt_search_market(category: str, budget: float | None = None,
-                            count: int = 3) -> dict:
+                            count: int = 3, pool: int | None = None) -> dict:
     """Search live LZT.market listings we can buy & resell within a budget, ranked
     by how much the previous owner spent (VP for Valorant, V-Bucks for Fortnite) so
     the customer gets the richest account their budget allows.
     `category` is 'valorant' or 'fortnite'. `budget` is the customer's max spend (EUR);
-    we cap the source price at budget / RESALE_MULTIPLIER. Returns {ok, items, error}."""
+    we cap the source price at budget / RESALE_MULTIPLIER. `pool` overrides how many
+    ranked items to return (used when we still need to filter by skin). Returns
+    {ok, items, error}."""
     out = {"ok": False, "items": [], "error": None}
     slug = LZT_MARKET_SLUGS.get(category.lower())
     if not slug:
@@ -515,7 +517,8 @@ async def lzt_search_market(category: str, budget: float | None = None,
     # Rank strictly by amount spent (highest VP / V-Bucks spent first), so within
     # the budget we always surface the accounts with the most invested in them.
     items.sort(key=lambda it: _spent_metric(category, it), reverse=True)
-    out.update(ok=True, items=items[:max(1, min(count, 5))])
+    limit = pool if pool else max(1, min(count, 5))
+    out.update(ok=True, items=items[:max(1, limit)])
     return out
 
 
@@ -588,7 +591,126 @@ def _valorant_skin_names(item: dict) -> list[str]:
     return []
 
 
-def market_account_embed(category: str, item: dict, image_name: str | None = None) -> discord.Embed:
+# ---- Valorant skin UUID → readable name resolution --------------------------
+# LZT returns Valorant skins as content UUIDs (e.g. "5b43d27b-..."), not names.
+# We resolve them via valorant-api.com (skins + skin levels + chromas cover every
+# UUID variant) and cache the map in memory after the first lookup.
+_UUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+_VAL_SKIN_MAP: dict[str, str] | None = None
+_val_skin_map_lock = asyncio.Lock()
+VALORANT_API_ENDPOINTS = (
+    "https://valorant-api.com/v1/weapons/skins",
+    "https://valorant-api.com/v1/weapons/skinlevels",
+    "https://valorant-api.com/v1/weapons/skinchromas",
+)
+
+
+async def _valorant_skin_map() -> dict[str, str]:
+    global _VAL_SKIN_MAP
+    if _VAL_SKIN_MAP is not None:
+        return _VAL_SKIN_MAP
+    async with _val_skin_map_lock:
+        if _VAL_SKIN_MAP is not None:
+            return _VAL_SKIN_MAP
+        m: dict[str, str] = {}
+        for url in VALORANT_API_ENDPOINTS:
+            try:
+                async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=25)) as s:
+                    async with s.get(url) as r:
+                        if r.status != 200:
+                            continue
+                        data = await r.json()
+                for entry in (data.get("data") or []):
+                    uid = str(entry.get("uuid") or "").lower()
+                    name = entry.get("displayName")
+                    if uid and name:
+                        m.setdefault(uid, str(name))
+            except Exception as e:
+                print("valorant-api fetch failed:", e)
+        # Cache only a non-empty result so a transient failure can retry later.
+        if m:
+            _VAL_SKIN_MAP = m
+        return m
+
+
+def _dedup_keep_order(names: list[str]) -> list[str]:
+    seen, out = set(), []
+    for n in names:
+        key = n.lower()
+        if key not in seen:
+            seen.add(key)
+            out.append(n)
+    return out
+
+
+async def _resolve_valorant_skins(item: dict) -> list[str]:
+    """Valorant skin names for an account, resolving UUIDs to readable names.
+    Unresolvable UUIDs are dropped (we never show raw IDs to customers)."""
+    raw = _valorant_skin_names(item)
+    if not raw:
+        return []
+    if not any(_UUID_RE.match(str(x)) for x in raw):
+        return _dedup_keep_order([str(x) for x in raw])
+    mapping = await _valorant_skin_map()
+    out: list[str] = []
+    for x in raw:
+        x = str(x)
+        if _UUID_RE.match(x):
+            nm = mapping.get(x.lower())
+            if nm:
+                out.append(nm)
+        else:
+            out.append(x)
+    return _dedup_keep_order(out)
+
+
+# ---- Fortnite cosmetic lists (skins, pickaxes, emotes, gliders, …) -----------
+# Candidate LZT keys per cosmetic type; each entry is a dict with a title (like
+# fortniteSkins) or a plain string. We probe several names defensively.
+_FN_COSMETIC_KEYS: dict[str, list[str]] = {
+    "Skins":       ["fortniteSkins", "fortnite_skins"],
+    "Pickaxes":    ["fortnitePickaxes", "fortnitePickaxe", "fortnite_pickaxes",
+                    "fortniteHarvestingTools", "fortnitePickaxes_list"],
+    "Emotes":      ["fortniteDances", "fortniteEmotes", "fortnite_dances", "fortnite_emotes"],
+    "Gliders":     ["fortniteGliders", "fortniteGlider", "fortnite_gliders"],
+    "Back Blings": ["fortniteBackpacks", "fortniteBackblings", "fortnite_backpacks"],
+}
+
+
+def _fn_cosmetic_names(item: dict, keys: list[str]) -> list[str]:
+    for k in keys:
+        v = item.get(k)
+        if isinstance(v, list) and v:
+            names = []
+            for s in v:
+                if isinstance(s, dict):
+                    n = s.get("title") or s.get("name")
+                    if n:
+                        names.append(str(n))
+                elif isinstance(s, str) and s.strip():
+                    names.append(s.strip())
+            if names:
+                return names
+    return []
+
+
+async def build_cosmetic_sections(category: str, item: dict) -> dict[str, list[str]]:
+    """Full, categorised cosmetic lists for an account, for the paginator/filter.
+    Valorant → {'Skins': [...]}; Fortnite → {'Skins': [...], 'Pickaxes': [...], …}."""
+    if category.lower() == "valorant":
+        skins = await _resolve_valorant_skins(item)
+        return {"Skins": skins} if skins else {}
+    sections: dict[str, list[str]] = {}
+    for label, keys in _FN_COSMETIC_KEYS.items():
+        names = _fn_cosmetic_names(item, keys)
+        if names:
+            sections[label] = names
+    return sections
+
+
+def market_account_embed(category: str, item: dict, image_name: str | None = None,
+                         valorant_skin_names: list[str] | None = None) -> discord.Embed:
     """Customer-facing embed describing one account: stats + skins image + price.
     Never exposes the sourcing marketplace. `image_name` is an attachment:// filename."""
     src, resale = _resale_price(item)
@@ -612,15 +734,15 @@ def market_account_embed(category: str, item: dict, image_name: str | None = Non
         e.add_field(name="🪙 VP Balance", value=f"{vp_wallet:,} VP", inline=True)
         e.add_field(name="🧍 Agents", value=str(agents), inline=True)
         e.add_field(name="🔪 Knives", value=str(knives), inline=True)
-        # List the actual skins on the account when the listing exposes them,
-        # so buyers see exactly what they're getting (not just a count/image).
-        skin_names = _valorant_skin_names(item)
+        # List the actual skins (resolved to names) so buyers see exactly what
+        # they're getting. The full list is browsable via the "View all skins" button.
+        skin_names = valorant_skin_names if valorant_skin_names is not None else _valorant_skin_names(item)
         if skin_names:
-            shown = skin_names[:20]
+            shown = skin_names[:15]
             skin_list = "\n".join(f"🔫 {n}" for n in shown)
             more = len(skin_names) - len(shown)
             if more > 0:
-                skin_list += f"\n…and **{more}** more"
+                skin_list += f"\n…and **{more}** more — tap **View all skins** below"
             e.add_field(name="🎨 Skin List", value=skin_list[:1024], inline=False)
     else:  # fortnite
         skins = item.get("fortnite_skin_count") or 0
@@ -635,7 +757,7 @@ def market_account_embed(category: str, item: dict, image_name: str | None = Non
         more = len(fn_skins) - len(names)
         skin_list = "\n".join(names) if names else "—"
         if more > 0:
-            skin_list += f"\n…and **{more}** more"
+            skin_list += f"\n…and **{more}** more — tap **View all skins** below"
         e = discord.Embed(
             title=f"🎮  Fortnite Account — {skins} Skins",
             description=f"**V-Bucks:** {vbucks:,}  •  **V-Bucks spent in shop:** {spent:,}",
@@ -671,7 +793,139 @@ async def build_account_message(category: str, item: dict, idx: int = 0):
         if data:
             image_name = f"account_{idx}.png"
             file = discord.File(io.BytesIO(data), filename=image_name)
-    return market_account_embed(category, item, image_name=image_name), file
+    val_skins = await _resolve_valorant_skins(item) if category.lower() == "valorant" else None
+    embed = market_account_embed(category, item, image_name=image_name,
+                                 valorant_skin_names=val_skins)
+    return embed, file
+
+
+# ============================================================
+# COSMETICS PAGINATOR — browse every skin/pickaxe/emote on an account
+# ============================================================
+def _account_item_id(item: dict) -> str:
+    return re.sub(r"[^0-9]", "", str(item.get("item_id") or item.get("id") or ""))
+
+
+class CosmeticsPager(discord.ui.View):
+    """Ephemeral, paged view of an account's full cosmetic inventory.
+    Fortnite gets a category selector (Skins / Pickaxes / Emotes / …)."""
+    PAGE_SIZE = 20
+
+    def __init__(self, category: str, title: str, sections: dict[str, list[str]]):
+        super().__init__(timeout=600)
+        self.category = category.lower()
+        self.title = title
+        self.sections = sections or {}
+        self.labels = list(self.sections.keys()) or ["Skins"]
+        self.sec = 0
+        self.page = 0
+
+        self.prev_btn = discord.ui.Button(label="◀ Prev", style=discord.ButtonStyle.secondary)
+        self.prev_btn.callback = self._prev
+        self.next_btn = discord.ui.Button(label="Next ▶", style=discord.ButtonStyle.secondary)
+        self.next_btn.callback = self._next
+        self.add_item(self.prev_btn)
+        self.add_item(self.next_btn)
+
+        if len(self.labels) > 1:
+            self.selector = discord.ui.Select(
+                placeholder="Choose a category…",
+                options=[discord.SelectOption(label=f"{l} ({len(self.sections[l])})"[:100], value=str(i))
+                         for i, l in enumerate(self.labels)],
+            )
+            self.selector.callback = self._select
+            self.add_item(self.selector)
+
+    def _cur(self) -> list[str]:
+        return self.sections.get(self.labels[self.sec], [])
+
+    def _page_count(self) -> int:
+        n = len(self._cur())
+        return max(1, (n + self.PAGE_SIZE - 1) // self.PAGE_SIZE)
+
+    def render(self) -> discord.Embed:
+        pages = self._page_count()
+        self.page = max(0, min(self.page, pages - 1))
+        lst = self._cur()
+        start = self.page * self.PAGE_SIZE
+        chunk = lst[start:start + self.PAGE_SIZE]
+        label = self.labels[self.sec]
+        emoji = "🔫" if self.category == "valorant" else "🎨"
+        numbered = [f"`{start + i + 1:>3}.` {emoji} {name}" for i, name in enumerate(chunk)]
+        e = discord.Embed(
+            title=f"{self.title} — {label}",
+            description="\n".join(numbered) if numbered else "—",
+            color=GUIDE_RIOT_COLOR if self.category == "valorant" else GUIDE_EPIC_COLOR,
+        )
+        self.prev_btn.disabled = self.next_btn.disabled = (pages <= 1)
+        e.set_footer(text=f"{label}: {len(lst)} total • Page {self.page + 1}/{pages}")
+        return e
+
+    async def _refresh(self, interaction: discord.Interaction):
+        await interaction.response.edit_message(embed=self.render(), view=self)
+
+    async def _prev(self, interaction: discord.Interaction):
+        self.page = (self.page - 1) % self._page_count()
+        await self._refresh(interaction)
+
+    async def _next(self, interaction: discord.Interaction):
+        self.page = (self.page + 1) % self._page_count()
+        await self._refresh(interaction)
+
+    async def _select(self, interaction: discord.Interaction):
+        self.sec = int(self.selector.values[0])
+        self.page = 0
+        await self._refresh(interaction)
+
+
+class ViewSkinsButton(discord.ui.DynamicItem[discord.ui.Button],
+                      template=r"af_skins:(?P<item_id>\d+):(?P<cat>[a-z]+)"):
+    """A persistent button attached to account embeds that opens the full,
+    paginated cosmetic list for that account (ephemeral, per viewer)."""
+    def __init__(self, item_id: int, cat: str, label: str = "🎨 View all skins"):
+        self.item_id = int(item_id)
+        self.cat = cat
+        super().__init__(
+            discord.ui.Button(label=label, style=discord.ButtonStyle.primary,
+                              custom_id=f"af_skins:{item_id}:{cat}")
+        )
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        return cls(int(match["item_id"]), match["cat"])
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        det = await lzt_item_detail(self.item_id)
+        if not det["ok"]:
+            await interaction.followup.send(
+                f"⚠️ Couldn't load this account's cosmetics: `{det['error']}`", ephemeral=True)
+            return
+        item = det["item"] or {}
+        sections = await build_cosmetic_sections(self.cat, item)
+        if not sections:
+            await interaction.followup.send(
+                "No detailed cosmetic list is available for this account.", ephemeral=True)
+            return
+        title = "Valorant Account" if self.cat == "valorant" else "Fortnite Account"
+        pager = CosmeticsPager(self.cat, title, sections)
+        await interaction.followup.send(embed=pager.render(), view=pager, ephemeral=True)
+
+
+def skins_view_for(items: list[dict], category: str) -> discord.ui.View | None:
+    """A View with one 'View all skins' button per account (max 5)."""
+    view = discord.ui.View(timeout=None)
+    added = 0
+    for i, it in enumerate(items):
+        iid = _account_item_id(it)
+        if not iid:
+            continue
+        label = "🎨 View all skins" if len(items) == 1 else f"🎨 Skins #{i + 1}"
+        view.add_item(ViewSkinsButton(int(iid), category.lower(), label=label))
+        added += 1
+        if added >= 5:
+            break
+    return view if added else None
 
 
 async def notify_restock(triggered_by: discord.abc.User | None, guild: discord.Guild,
@@ -1957,18 +2211,27 @@ MARKET_CATEGORY_CHOICES = [
 ]
 
 
+MARKET_MAX_SCAN = 20  # cap on detail lookups when filtering by skin
+
+
 @bot.tree.command(name="market",
                   description="Browse Valorant/Fortnite accounts available to buy, within a budget.")
 @app_commands.describe(
     category="Game the customer wants",
     budget="Customer's max budget in EUR (optional — we find accounts that fit)",
     count="How many accounts to show (1-5, default 3)",
+    skins="Optional: require specific skin(s). Comma-separated for more than one (e.g. reaver, prime).",
 )
 @app_commands.choices(category=MARKET_CATEGORY_CHOICES)
 async def market_command(interaction: discord.Interaction, category: app_commands.Choice[str],
-                         budget: float | None = None, count: int = 3):
+                         budget: float | None = None, count: int = 3, skins: str | None = None):
     await interaction.response.defer()
-    res = await lzt_search_market(category.value, budget=budget, count=count)
+    count = max(1, min(count, 5))
+    wanted = [s.strip() for s in re.split(r"[,\n]+", skins) if s.strip()] if skins else []
+
+    # When filtering by skin we scan a bigger ranked pool and keep the matches.
+    pool = MARKET_MAX_SCAN if wanted else count
+    res = await lzt_search_market(category.value, budget=budget, count=count, pool=pool)
     if not res["ok"]:
         await interaction.followup.send(f"⚠️ Stock error: `{res['error']}`", ephemeral=True)
         return
@@ -1978,19 +2241,51 @@ async def market_command(interaction: discord.Interaction, category: app_command
             + (f" under €{budget:.0f}." if budget else "."), ephemeral=True)
         return
 
-    embeds, files = [], []
-    for i, it in enumerate(res["items"]):
+    # Pull details (needed for skin lists + rich rendering); keep matches until we
+    # have `count`, bounded by MARKET_MAX_SCAN so we never hammer the API.
+    chosen: list[dict] = []
+    scanned = 0
+    for it in res["items"]:
+        if len(chosen) >= count or scanned >= MARKET_MAX_SCAN:
+            break
         det = await lzt_item_detail(it.get("item_id") or it.get("id"))
-        embed, file = await build_account_message(category.value, det["item"] if det["ok"] else it, i)
+        scanned += 1
+        item = det["item"] if det["ok"] else it
+        if wanted:
+            sections = await build_cosmetic_sections(category.value, item)
+            owned = [n.lower() for names in sections.values() for n in names]
+            if not all(any(w.lower() in n for n in owned) for w in wanted):
+                continue
+        chosen.append(item)
+
+    if not chosen:
+        msg = f"No {category.name} accounts matched"
+        if wanted:
+            msg += f" the skin(s): **{', '.join(wanted)}**"
+        if budget:
+            msg += f" under €{budget:.0f}"
+        await interaction.followup.send(msg + ".", ephemeral=True)
+        return
+
+    embeds, files = [], []
+    for i, item in enumerate(chosen):
+        embed, file = await build_account_message(category.value, item, i)
         embeds.append(embed)
         if file:
             files.append(file)
 
     spent_label = "VP spent" if category.value == "valorant" else "V-Bucks spent"
     header = f"🛍️ **{category.name} accounts available** — highest **{spent_label}** first"
+    if wanted:
+        header += f" · matching **{', '.join(wanted)}**"
     if budget:
-        header += f", within a **€{budget:.0f}** budget"
-    await interaction.followup.send(content=header, embeds=embeds[:10], files=files)
+        header += f" · within a **€{budget:.0f}** budget"
+
+    view = skins_view_for(chosen, category.value)
+    kwargs = {"content": header, "embeds": embeds[:10], "files": files}
+    if view is not None:
+        kwargs["view"] = view
+    await interaction.followup.send(**kwargs)
 
 
 @bot.tree.command(name="account_info",
@@ -2011,7 +2306,11 @@ async def account_info_command(interaction: discord.Interaction, item_id: str):
             ephemeral=True)
         return
     embed, file = await build_account_message(category, item, 0)
-    await interaction.followup.send(embed=embed, files=[file] if file else [])
+    view = skins_view_for([item], category)
+    kwargs = {"embed": embed, "files": [file] if file else []}
+    if view is not None:
+        kwargs["view"] = view
+    await interaction.followup.send(**kwargs)
 
 
 @bot.tree.command(name="reserve",
@@ -3351,6 +3650,11 @@ async def on_ready():
     bot.add_view(DeliveryApprovalView())
     bot.add_view(CryptoPayView())
     bot.add_view(CryptoCheckView())
+    # Resolve "View all skins" buttons on account embeds after restarts.
+    try:
+        bot.add_dynamic_items(ViewSkinsButton)
+    except Exception as e:
+        print("Dynamic item register failed:", e)
 
     rows = await db_fetch(
         "SELECT channel_id, control_message_id FROM tickets WHERE guild_id=$1 AND status='open' AND control_message_id IS NOT NULL",
