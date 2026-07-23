@@ -2,6 +2,7 @@ import os
 import re
 import io
 import json
+import base64
 import asyncio
 from datetime import datetime, timezone
 
@@ -41,6 +42,14 @@ CUSTOM_CATEGORY_ID = int(os.getenv("CUSTOM_CATEGORY_ID", "0") or "0")
 SUPPORT_CATEGORY_ID = int(os.getenv("SUPPORT_CATEGORY_ID", "0") or "0")
 
 TICKET_LOG_CHANNEL_ID = int(os.getenv("TICKET_LOG_CHANNEL_ID", "0") or "0")
+
+# Reviews/vouches channel: when a customer posts here, their open ticket
+# auto-closes and they receive the customer role.
+REPS_CHANNEL_ID = int(os.getenv("REPS_CHANNEL_ID", "1485262743492624578") or "0")
+# Role granted to a customer once they leave a review.
+CUSTOMER_ROLE_ID = int(os.getenv("CUSTOMER_ROLE_ID", "1485241355629367420") or "0")
+# Terms of Service channel — linked again at card checkout.
+TOS_CHANNEL_ID = int(os.getenv("TOS_CHANNEL_ID", "1485235773606199326") or "0")
 
 STATUS_ROTATE_SECONDS = int(os.getenv("STATUS_ROTATE_SECONDS", "15") or "15")
 DELETE_COUNTDOWN_SECONDS = int(os.getenv("DELETE_COUNTDOWN_SECONDS", "5") or "5")
@@ -257,6 +266,12 @@ ALTER TABLE tickets ADD COLUMN IF NOT EXISTS checkout_method TEXT NULL;
 -- Kill-switch: when TRUE, all AI automation (intake, shopping, proof auto-forward)
 -- is off for this ticket so staff can take over manually.
 ALTER TABLE tickets ADD COLUMN IF NOT EXISTS ai_disabled BOOLEAN NOT NULL DEFAULT FALSE;
+-- Exact amount the customer must pay for the current checkout (used to verify proof).
+ALTER TABLE tickets ADD COLUMN IF NOT EXISTS checkout_total NUMERIC NULL;
+-- Replacement proof progress: NULL/'payment' → 'video' → forwarded.
+ALTER TABLE tickets ADD COLUMN IF NOT EXISTS proof_stage TEXT NULL;
+-- How many times unclear/invalid proof was uploaded (to escalate to staff).
+ALTER TABLE tickets ADD COLUMN IF NOT EXISTS proof_attempts INTEGER NOT NULL DEFAULT 0;
 
 -- Record of every account released, so a SellAuth order can never be used twice.
 CREATE TABLE IF NOT EXISTS deliveries (
@@ -3397,7 +3412,7 @@ async def post_crypto_checkout(channel: discord.TextChannel, price: float) -> No
     """Post the crypto (NowPayments) checkout for `price` EUR into the ticket."""
     await db_execute(
         "UPDATE tickets SET crypto_amount=$1, crypto_payment_id=NULL, crypto_paid=FALSE, "
-        "checkout_method='crypto' WHERE channel_id=$2",
+        "checkout_method='crypto', checkout_total=$1 WHERE channel_id=$2",
         price, channel.id)
     e = discord.Embed(
         title="💳  Pay with Crypto",
@@ -3411,23 +3426,28 @@ async def post_crypto_checkout(channel: discord.TextChannel, price: float) -> No
 
 
 async def post_card_checkout(channel: discord.TextChannel, account_price: float) -> None:
-    """Post the card guide + the amount to pay (account price × card tax)."""
-    total = account_price * CARD_TAX_MULTIPLIER
+    """Post the card guide + the exact amount to pay (account price × card tax),
+    re-link the Terms of Service, and arm proof verification."""
+    total = round(account_price * CARD_TAX_MULTIPLIER, 2)
     pct = int(round((CARD_TAX_MULTIPLIER - 1) * 100))
     await db_execute(
-        "UPDATE tickets SET awaiting_proof=TRUE, checkout_method='card' WHERE channel_id=$1",
-        channel.id)
+        "UPDATE tickets SET awaiting_proof=TRUE, checkout_method='card', "
+        "checkout_total=$1, proof_attempts=0 WHERE channel_id=$2",
+        total, channel.id)
     await channel.send(embeds=make_card_embeds(), view=CardView(),
                        files=embed_files() + card_proof_files())
+    tos_line = (f"\n\n📜 By paying you agree to our **Terms of Service** — please read them: "
+                f"<#{TOS_CHANNEL_ID}>") if TOS_CHANNEL_ID else ""
     e = discord.Embed(
         title="💳  Card Payment — Amount to Pay",
         description=(
             f"Account price: **€{account_price:.2f}**\n"
             f"Card fee (**+{pct}%**) included\n"
             f"**Total to pay by card: €{total:.2f}**\n\n"
-            f"Follow the guide above, then **upload a screenshot of your payment and the "
-            f"confirmation email** right here. Once you do, I'll pass your order to the owner "
-            f"to finalize. 🙏"),
+            f"Pay the **exact** total above, then **upload a screenshot of your payment "
+            f"confirmation AND your confirmation email** right here. I'll check that it says "
+            f"*payment confirmed*, the amount matches, and the order IDs line up — then pass "
+            f"your order to the owner.{tos_line}"),
         color=AF_BLUE,
     )
     e.set_footer(text="AF SERVICES • Card Checkout")
@@ -3609,28 +3629,202 @@ async def run_ai_shopping(channel: discord.TextChannel, owner: discord.abc.User)
             await channel.send("Would you like to pay by **crypto** or **card**?")
 
 
-async def handle_proof_upload(message: discord.Message, kind: str) -> None:
-    """Customer uploaded proof (card-payment screenshot, or replacement evidence).
-    Acknowledge it and auto-forward the ticket to the owner (who does the final call).
-    Videos are acknowledged but not judged by the AI — the owner reviews them."""
+_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".gif")
+_VIDEO_EXTS = (".mp4", ".mov", ".webm", ".mkv", ".avi", ".m4v")
+
+
+def _message_has_video(message: discord.Message) -> bool:
+    return any(
+        (a.content_type or "").startswith("video")
+        or a.filename.lower().endswith(_VIDEO_EXTS)
+        for a in message.attachments)
+
+
+async def _download_proof_images(message: discord.Message, limit: int = 5) -> list[tuple[bytes, str]]:
+    """Return [(bytes, media_type)] for image attachments (for AI vision)."""
+    out: list[tuple[bytes, str]] = []
+    for a in message.attachments:
+        ct = (a.content_type or "").lower()
+        is_img = ct.startswith("image/") or a.filename.lower().endswith(_IMAGE_EXTS)
+        if not is_img:
+            continue
+        data = await _fetch_bytes(a.url)
+        if not data:
+            continue
+        media = ct if ct.startswith("image/") else "image/png"
+        if media == "image/jpg":
+            media = "image/jpeg"
+        out.append((data, media))
+        if len(out) >= limit:
+            break
+    return out
+
+
+async def _ai_vision_json(system: str, text: str, images: list[tuple[bytes, str]]) -> dict:
+    """One vision call over the given images; returns the parsed JSON (or {})."""
+    if not (AI_ENABLED and anthropic_client):
+        return {}
+    content: list[dict] = []
+    for data, media in images:
+        content.append({"type": "image", "source": {
+            "type": "base64", "media_type": media,
+            "data": base64.b64encode(data).decode("ascii")}})
+    content.append({"type": "text", "text": text})
+    try:
+        resp = await anthropic_client.messages.create(
+            model=AI_MODEL, max_tokens=500, system=system,
+            messages=[{"role": "user", "content": content}])
+        raw = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
+    except Exception as e:
+        print("AI vision error:", e)
+        return {}
+    return _extract_json(raw) or {}
+
+
+async def verify_card_proof(images: list[tuple[bytes, str]], total: float) -> dict:
+    """AI-check card payment proof. Returns the raw verdict fields."""
+    system = ("You verify card-payment proof for a Discord gaming-account shop. Be strict but "
+              "fair. Only report what is actually visible in the images — never assume.")
+    text = (
+        f"The customer must pay EXACTLY €{total:.2f} by card. They should provide (a) a payment "
+        f"CONFIRMATION screenshot clearly showing success (e.g. 'Payment confirmed', 'Payment "
+        f"successful', 'completed'), and (b) a confirmation EMAIL/receipt showing the amount. "
+        f"From the image(s) provided, determine:\n"
+        f"- has_confirmation: is a clear payment-SUCCESS screen shown?\n"
+        f"- has_email: is a confirmation email/receipt shown?\n"
+        f"- amount_paid: the exact amount actually paid (number only), or null if not visible\n"
+        f"- ids_match: does an order/transaction/purchase ID appear on BOTH and match? "
+        f"(true/false, or null if only one is present)\n"
+        f"- unreadable: true if the image(s) are too blurry/cropped to read\n"
+        f"- reason: ONE short sentence telling the customer what (if anything) to fix.\n"
+        f'Respond with ONLY JSON: {{"has_confirmation": bool, "has_email": bool, '
+        f'"amount_paid": number|null, "ids_match": bool|null, "unreadable": bool, "reason": "..."}}')
+    return await _ai_vision_json(system, text, images)
+
+
+async def verify_purchase_proof(images: list[tuple[bytes, str]]) -> dict:
+    """AI-check that an image plausibly proves a past purchase (for replacements)."""
+    system = ("You verify proof-of-purchase for a Discord gaming-account shop's replacement "
+              "request. Only report what is actually visible.")
+    text = ("Does the image clearly show a plausible proof of purchase — an order confirmation, "
+            "payment receipt, invoice, or a visible order/transaction ID? "
+            'Respond with ONLY JSON: {"is_proof": bool, "unreadable": bool, "reason": "<one short sentence>"}')
+    return await _ai_vision_json(system, text, images)
+
+
+async def _forward_with_note(channel: discord.TextChannel, note: str) -> None:
+    await channel.send(note)
+    await db_execute("UPDATE tickets SET awaiting_proof=FALSE WHERE channel_id=$1", channel.id)
+    await forward_ticket_flow(channel, None)
+
+
+async def handle_proof_upload(message: discord.Message, row) -> None:
+    """Verify uploaded proof before forwarding. Card: AI reads the payment screenshot +
+    email (payment confirmed, exact amount, matching order IDs, not underpaid). Replacement:
+    AI verifies the purchase image, then requires a video, then forwards (owner judges the video).
+    Never forwards on unclear/insufficient proof."""
     ch = message.channel
     if not isinstance(ch, discord.TextChannel):
         return
-    has_video = any(
-        (a.content_type or "").startswith("video")
-        or a.filename.lower().endswith((".mp4", ".mov", ".webm", ".mkv", ".avi", ".m4v"))
-        for a in message.attachments)
+    kind = row["kind"]
+    has_video = _message_has_video(message)
+    images = await _download_proof_images(message)
 
-    if kind == "support":
-        ack = "📎 Thanks — I've received your video." if has_video else "📎 Thanks — I've received your proof."
-        detail = "The owner will review your replacement request now."
-    else:  # card payment proof (custom/buy)
-        ack = "📎 Thanks — I've received your payment proof."
-        detail = "The owner will verify your payment and deliver your account."
+    async def _bump_attempts() -> int:
+        n = int(row["proof_attempts"] or 0) + 1
+        await db_execute("UPDATE tickets SET proof_attempts=$1 WHERE channel_id=$2", n, ch.id)
+        return n
 
-    await ch.send(f"✅ {ack} Please **wait for the owner** — {detail} 🙏")
-    await db_execute("UPDATE tickets SET awaiting_proof=FALSE WHERE channel_id=$1", ch.id)
-    await forward_ticket_flow(ch, None)
+    # If the AI is unavailable, fall back to the old acknowledge-and-forward behavior.
+    if not (AI_ENABLED and anthropic_client):
+        await _forward_with_note(
+            ch, "📎 Proof received. Please **wait for the owner** to review and finalize. 🙏")
+        return
+
+    # ---------------- CARD PAYMENT PROOF (custom/buy) ----------------
+    if kind != "support":
+        total = float(row["checkout_total"]) if row["checkout_total"] is not None else None
+        if not images:
+            await ch.send("Please upload a **screenshot of your payment confirmation** and your "
+                          "**confirmation email** so I can verify the payment. 📸")
+            return
+        v = await verify_card_proof(images, total or 0.0)
+        if not v:
+            await ch.send("I couldn't read that clearly — please re-upload a **clear, full** "
+                          "screenshot of your payment confirmation and email. 📸")
+            return
+        if v.get("unreadable"):
+            n = await _bump_attempts()
+            if n >= 2:
+                await ch.send("I still can't read the proof clearly. A staff member will take a "
+                              "look shortly — thank you for your patience. 🙏")
+                return
+            await ch.send("That image is too blurry/cropped to read — please upload a **clearer, "
+                          "full-screen** screenshot. 📸")
+            return
+        if not v.get("has_confirmation"):
+            await ch.send("I don't see a **payment confirmation** yet. Please upload a screenshot "
+                          "that clearly shows your payment was **confirmed/successful**. ✅")
+            return
+        if not v.get("has_email"):
+            await ch.send("Thanks! I also need your **confirmation email** (showing the amount) "
+                          "to verify the order — please upload it too. 📧")
+            return
+        amount = v.get("amount_paid")
+        try:
+            amount = float(amount) if amount is not None else None
+        except (TypeError, ValueError):
+            amount = None
+        if total and amount is not None and amount + 0.009 < total:
+            await ch.send(f"It looks like you paid **€{amount:.2f}**, but the total is "
+                          f"**€{total:.2f}**. Please **top up the remaining €{total - amount:.2f}** "
+                          f"and re-upload your proof. 🙏")
+            return
+        if v.get("ids_match") is False:
+            await ch.send("The **order IDs** on your payment screenshot and email don't match — "
+                          "please double-check and upload matching proof for this order. 🔎")
+            return
+        # All checks passed → forward to owner.
+        await _forward_with_note(
+            ch, "✅ Payment verified — amount and order details check out. Forwarding to the "
+                "owner to deliver your account now. 🙏")
+        return
+
+    # ---------------- REPLACEMENT PROOF (support): payment → video → forward ----------------
+    stage = row["proof_stage"] or "payment"
+    if stage == "payment":
+        if not images:
+            await ch.send("First, please upload your **proof of purchase** (order confirmation / "
+                          "payment receipt / order ID) as an image. 📸")
+            return
+        v = await verify_purchase_proof(images)
+        if not v or v.get("unreadable"):
+            n = await _bump_attempts()
+            if n >= 2:
+                await ch.send("I can't read that clearly — a staff member will review your "
+                              "request shortly. 🙏")
+                return
+            await ch.send("That image is hard to read — please upload a **clearer** proof of "
+                          "purchase. 📸")
+            return
+        if not v.get("is_proof"):
+            await ch.send("That doesn't look like a proof of purchase. Please upload your "
+                          "**order confirmation / receipt** for this account. 🧾")
+            return
+        await db_execute(
+            "UPDATE tickets SET proof_stage='video', proof_attempts=0 WHERE channel_id=$1", ch.id)
+        await ch.send("✅ Purchase verified. Now please upload a **video** clearly showing the "
+                      "issue with the account, so the owner can review it. 🎥")
+        return
+
+    # stage == 'video'
+    if not has_video:
+        await ch.send("Almost there — please upload a **video** (not an image) that clearly shows "
+                      "the issue, so the owner can review it. 🎥")
+        return
+    await _forward_with_note(
+        ch, "✅ Video received. I've verified your purchase and forwarded your replacement request "
+            "to the owner to review the video. Please wait for the owner. 🙏")
 
 
 # ============================================================
@@ -3683,6 +3877,39 @@ async def refresh_ticket_control_message(channel: discord.TextChannel):
 # ============================================================
 # CLOSE FLOW
 # ============================================================
+async def handle_review_post(message: discord.Message) -> None:
+    """A customer left a review in the reps channel: give them the customer role and
+    auto-close any open ticket(s) they own."""
+    guild = message.guild
+    member = message.author
+    if guild is None or not isinstance(member, discord.Member):
+        return
+
+    # Grant the customer role (skip staff — they don't need it).
+    if CUSTOMER_ROLE_ID and not is_staff(member):
+        role = guild.get_role(CUSTOMER_ROLE_ID)
+        if role and role not in member.roles:
+            try:
+                await member.add_roles(role, reason="Left a review")
+            except Exception as e:
+                print("Customer role grant failed:", e)
+
+    # Auto-close their open tickets (thanks them + saves/DMs the transcript).
+    rows = await db_fetch(
+        "SELECT channel_id FROM tickets WHERE guild_id=$1 AND owner_id=$2 AND status='open'",
+        guild.id, member.id)
+    for r in rows:
+        ch = guild.get_channel(int(r["channel_id"]))
+        if isinstance(ch, discord.TextChannel):
+            try:
+                await ch.send("🌟 Thanks for your review! Closing this ticket now.")
+                await close_ticket_flow(
+                    ch, closed_by=f"Auto-close (review by {member})",
+                    reason="Customer left a review ✅")
+            except Exception as e:
+                print("Review auto-close failed:", e)
+
+
 async def close_ticket_flow(channel: discord.TextChannel, closed_by: str, reason: str):
     row = await db_fetchrow(
         "SELECT status, claimed_by, owner_id FROM tickets WHERE channel_id=$1",
@@ -3773,9 +4000,20 @@ async def on_message(message: discord.Message):
     if not isinstance(message.channel, discord.TextChannel):
         return
 
+    # A customer posting in the reviews/reps channel → grant the customer role and
+    # auto-close their open ticket(s).
+    if REPS_CHANNEL_ID and message.channel.id == REPS_CHANNEL_ID:
+        try:
+            await handle_review_post(message)
+        except Exception as e:
+            print("Review handling failed:", e)
+        await bot.process_commands(message)
+        return
+
     row = await db_fetchrow(
         """SELECT created_at, first_staff_response_seconds, status, kind, owner_id,
-                  ai_handled, claimed_by, forwarded_to_owner, awaiting_proof, ai_disabled
+                  ai_handled, claimed_by, forwarded_to_owner, awaiting_proof, ai_disabled,
+                  checkout_total, proof_stage, proof_attempts
            FROM tickets WHERE channel_id=$1""",
         message.channel.id
     )
@@ -3816,7 +4054,8 @@ async def on_message(message: discord.Message):
     ):
         ai_locks.add(message.channel.id)
         try:
-            await handle_proof_upload(message, row["kind"])
+            async with message.channel.typing():
+                await handle_proof_upload(message, row)
         except Exception as e:
             print("Proof handling failed:", e)
         finally:
