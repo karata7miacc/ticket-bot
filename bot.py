@@ -51,6 +51,20 @@ CUSTOMER_ROLE_ID = int(os.getenv("CUSTOMER_ROLE_ID", "1485241355629367420") or "
 # Terms of Service channel — linked again at card checkout.
 TOS_CHANNEL_ID = int(os.getenv("TOS_CHANNEL_ID", "1485235773606199326") or "0")
 
+# --- Automation / housekeeping ---
+# Auto-close tickets idle for this many hours (0 = never auto-close).
+IDLE_CLOSE_HOURS = float(os.getenv("IDLE_CLOSE_HOURS", "48") or "48")
+# Hours after a delivery before we DM the buyer a review reminder (0 = off).
+REVIEW_REMINDER_HOURS = float(os.getenv("REVIEW_REMINDER_HOURS", "12") or "12")
+# Low-stock alerting: warn when valid stock in a game drops below this count.
+LOW_STOCK_THRESHOLD = int(os.getenv("LOW_STOCK_THRESHOLD", "2") or "2")
+LOW_STOCK_CATEGORIES = [c.strip() for c in
+                        os.getenv("LOW_STOCK_CATEGORIES", "fortnite,valorant").split(",") if c.strip()]
+# Optional role granted with /compensation (e.g. a discount role).
+COMPENSATION_ROLE_ID = int(os.getenv("COMPENSATION_ROLE_ID", "0") or "0")
+# Warranty text shown on delivery and in replacement tickets.
+WARRANTY_TEXT = os.getenv("WARRANTY_TEXT", "24-hour warranty & replacement support")
+
 STATUS_ROTATE_SECONDS = int(os.getenv("STATUS_ROTATE_SECONDS", "15") or "15")
 DELETE_COUNTDOWN_SECONDS = int(os.getenv("DELETE_COUNTDOWN_SECONDS", "5") or "5")
 
@@ -286,6 +300,20 @@ CREATE TABLE IF NOT EXISTS deliveries (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS uq_delivery_order
 ON deliveries (order_id) WHERE order_id IS NOT NULL;
+-- Price charged (for /sales revenue) and whether we've sent the review reminder.
+ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS price NUMERIC NULL;
+ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS review_reminded BOOLEAN NOT NULL DEFAULT FALSE;
+
+-- Compensation grants logged from /compensation.
+CREATE TABLE IF NOT EXISTS compensations (
+  id SERIAL PRIMARY KEY,
+  guild_id BIGINT NOT NULL,
+  user_id BIGINT NOT NULL,
+  amount TEXT NULL,
+  reason TEXT NULL,
+  granted_by BIGINT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
 """
 
 
@@ -1166,6 +1194,8 @@ def credentials_embed(product: str | None, order_id: str | None,
             body += f"**Email login:** ||{email_raw}||\n"
 
     body += "\nFollow **/guide** to lock the account to you (change email/password, enable 2FA)."
+    if WARRANTY_TEXT:
+        body += f"\n🛡️ **Warranty:** {WARRANTY_TEXT}."
 
     e = discord.Embed(title="📦  Your Account — Delivered", description=body, color=0x2ECC71)
     if product:
@@ -1211,13 +1241,17 @@ async def deliver_account(
         await channel.send(f"⚠️ Couldn't load that account from stock: `{creds['error']}`")
         return False
 
+    # Price charged for this order (for /sales), if we recorded one at checkout.
+    trow = await db_fetchrow("SELECT checkout_total FROM tickets WHERE channel_id=$1", channel.id)
+    price = float(trow["checkout_total"]) if trow and trow["checkout_total"] is not None else None
+
     # Record first (unique index on order_id makes a double-deliver fail loudly).
     try:
         await db_execute(
-            """INSERT INTO deliveries(channel_id, owner_id, product, order_id, lzt_item_id, delivered_by)
-               VALUES ($1,$2,$3,$4,$5,$6)""",
+            """INSERT INTO deliveries(channel_id, owner_id, product, order_id, lzt_item_id, delivered_by, price)
+               VALUES ($1,$2,$3,$4,$5,$6,$7)""",
             channel.id, owner.id, product, order_id, int(re.sub(r"[^0-9]", "", str(lzt_item_id)) or 0),
-            delivered_by,
+            delivered_by, price,
         )
     except asyncpg.UniqueViolationError:
         await channel.send("⚠️ That order was already delivered (duplicate blocked).")
@@ -1463,7 +1497,8 @@ def make_proof_checklist_embed(kind: str) -> discord.Embed:
         e = discord.Embed(
             title="📋  Before we can process your replacement / issue",
             description=(
-                "So we can verify eligibility and hand off to the owner, please provide the "
+                (f"🛡️ **Warranty:** {WARRANTY_TEXT}.\n\n" if WARRANTY_TEXT else "")
+                + "So we can verify eligibility and hand off to the owner, please provide the "
                 "following.\n" + DIVIDER
             ),
             color=AF_BLUE,
@@ -2979,12 +3014,43 @@ def make_epic_guide_embed() -> discord.Embed:
     return e
 
 
+def make_chatgpt_guide_embed() -> discord.Embed:
+    e = discord.Embed(
+        title="🤖  ChatGPT / OpenAI — Account Security Guide",
+        description=(f"Follow these steps to make the account fully yours. Do everything from "
+                     f"**your own browser** while logged in.\n{DIVIDER}"),
+        color=0x10A37F,
+    )
+    steps = [
+        ("1️⃣  Log in & open Settings",
+         "Sign in at [chatgpt.com](https://chatgpt.com), then open **Settings** → **Account**."),
+        ("2️⃣  Change the email to YOUR email",
+         "Update the account email to one **you** control, and confirm it via the verification "
+         "link sent to your inbox (use the email access included with your delivery to grab any "
+         "code, then switch it to your own address)."),
+        ("3️⃣  Change the password",
+         "Set a **new, unique password** you haven't used elsewhere."),
+        ("4️⃣  Enable your own 2FA",
+         "Turn on **Multi-Factor Authentication** with **your own** authenticator app so only you "
+         "can log in."),
+        ("5️⃣  Log out other sessions",
+         "In Settings → **Security**, use **Log out of all devices** to remove any previous sessions."),
+    ]
+    for name, value in steps:
+        e.add_field(name=name, value=value, inline=False)
+    e.set_author(name="AF SERVICES • Account Guides")
+    e.set_thumbnail(url=logo_ref())
+    e.set_footer(text="AF SERVICES | ChatGPT Guide")
+    return e
+
+
 @bot.tree.command(name="guide", description="View the account security guide for a game platform.")
 @app_commands.describe(game="Select the game platform")
 @app_commands.choices(game=[
     app_commands.Choice(name="Steam", value="steam"),
     app_commands.Choice(name="Riot Games", value="riot_game"),
     app_commands.Choice(name="Epic Games", value="epic_games"),
+    app_commands.Choice(name="ChatGPT / OpenAI", value="chatgpt"),
 ])
 async def guide_command(interaction: discord.Interaction, game: app_commands.Choice[str]):
     if game.value == "steam":
@@ -2995,9 +3061,169 @@ async def guide_command(interaction: discord.Interaction, game: app_commands.Cho
         await interaction.response.send_message(
             embed=embed, view=RiotGuideView(), files=embed_files()
         )
+    elif game.value == "chatgpt":
+        embed = make_chatgpt_guide_embed()
+        await interaction.response.send_message(embed=embed, files=embed_files())
     else:
         embed = make_epic_guide_embed()
         await interaction.response.send_message(embed=embed, files=embed_files())
+
+
+# ============================================================
+# STATUS / SALES / ORDERS / COMPENSATION / PROOF OVERRIDE
+# ============================================================
+def _mask_secret(s: str) -> str:
+    if not s:
+        return "—"
+    return f"{s[:7]}…{s[-3:]}" if len(s) > 12 else "set"
+
+
+@bot.tree.command(name="aistatus", description="Show the bot's live AI / integration config (staff).")
+@staff_only()
+async def aistatus_command(interaction: discord.Interaction):
+    e = discord.Embed(title="🤖  Bot Status", color=AF_BLUE)
+    e.add_field(name="AI",
+                value=(f"{'🟢 ON' if AI_ENABLED else '🔴 OFF'} • model `{AI_MODEL}`\n"
+                       f"key `{_mask_secret(ANTHROPIC_API_KEY)}`"), inline=False)
+    e.add_field(name="LZT.market",
+                value=(f"{'🟢 ON' if LZT_ENABLED else '🔴 OFF'} • user `{LZT_USER_ID or '—'}`\n"
+                       f"token `{_mask_secret(LZT_API_TOKEN)}`"), inline=False)
+    e.add_field(name="NowPayments", value="🟢 ON" if NOWPAYMENTS_ENABLED else "🔴 OFF", inline=True)
+    e.add_field(name="SellAuth", value="🟢 ON" if SELLAUTH_ENABLED else "🔴 OFF", inline=True)
+    e.add_field(name="Owner role",
+                value=(f"<@&{OWNER_ROLE_ID}>" if OWNER_ROLE_ID else "—"), inline=True)
+    e.add_field(
+        name="Reps • Customer role • TOS",
+        value=(f"{'<#'+str(REPS_CHANNEL_ID)+'>' if REPS_CHANNEL_ID else '—'} • "
+               f"{'<@&'+str(CUSTOMER_ROLE_ID)+'>' if CUSTOMER_ROLE_ID else '—'} • "
+               f"{'<#'+str(TOS_CHANNEL_ID)+'>' if TOS_CHANNEL_ID else '—'}"), inline=False)
+    e.add_field(
+        name="Automation",
+        value=(f"idle-close **{IDLE_CLOSE_HOURS:g}h** • review reminder **{REVIEW_REMINDER_HOURS:g}h** • "
+               f"low-stock **<{LOW_STOCK_THRESHOLD}** • card tax **×{CARD_TAX_MULTIPLIER}** • "
+               f"markup **×{RESALE_MULTIPLIER}**"), inline=False)
+    e.set_footer(text="AF SERVICES • Status")
+    await interaction.response.send_message(embed=e, ephemeral=True)
+
+
+@bot.tree.command(name="sales", description="Delivery & revenue stats (staff).")
+@staff_only()
+@app_commands.describe(days="Look back this many days (default 30)")
+async def sales_command(interaction: discord.Interaction, days: int = 30):
+    days = max(1, min(days, 365))
+    await interaction.response.defer(ephemeral=True)
+    rows = await db_fetch(
+        "SELECT product, price FROM deliveries WHERE delivered_at > NOW() - make_interval(days => $1)",
+        days)
+    total = len(rows)
+    revenue = sum(float(r["price"]) for r in rows if r["price"] is not None)
+    priced = sum(1 for r in rows if r["price"] is not None)
+    by_product: dict[str, int] = {}
+    for r in rows:
+        p = (r["product"] or "Account").strip()[:40]
+        by_product[p] = by_product.get(p, 0) + 1
+    top = sorted(by_product.items(), key=lambda kv: kv[1], reverse=True)[:8]
+
+    e = discord.Embed(title=f"📈  Sales — last {days} day(s)", color=0x2ECC71)
+    e.add_field(name="Delivered", value=str(total), inline=True)
+    e.add_field(name="Revenue", value=f"€{revenue:,.2f}", inline=True)
+    e.add_field(name="Avg / order",
+                value=(f"€{revenue/priced:,.2f}" if priced else "—"), inline=True)
+    if priced < total:
+        e.add_field(name="Note", value=f"Revenue covers **{priced}/{total}** orders with a recorded price.",
+                    inline=False)
+    if top:
+        e.add_field(name="Top products",
+                    value="\n".join(f"**{n}×** {name}" for name, n in top), inline=False)
+    e.set_footer(text="AF SERVICES • Sales")
+    await interaction.followup.send(embed=e, ephemeral=True)
+
+
+@bot.tree.command(name="myorders", description="See your past orders with us.")
+async def myorders_command(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    rows = await db_fetch(
+        "SELECT product, price, delivered_at FROM deliveries WHERE owner_id=$1 "
+        "ORDER BY delivered_at DESC LIMIT 25", interaction.user.id)
+    if not rows:
+        await interaction.followup.send("You don't have any orders on record yet.", ephemeral=True)
+        return
+    lines = []
+    for r in rows:
+        when = r["delivered_at"].strftime("%Y-%m-%d")
+        price = f" — €{float(r['price']):.2f}" if r["price"] is not None else ""
+        lines.append(f"• **{r['product'] or 'Account'}** — {when}{price}")
+    e = discord.Embed(title="🧾  Your Orders", description="\n".join(lines)[:4000], color=AF_BLUE)
+    e.set_footer(text=f"AF SERVICES • {len(rows)} order(s)")
+    await interaction.followup.send(embed=e, ephemeral=True)
+
+
+@bot.tree.command(name="compensation", description="Log & grant compensation to a customer (staff).")
+@staff_only()
+@app_commands.describe(member="The customer", amount="e.g. '€5 store credit' or '10% off'",
+                       reason="Why they're being compensated")
+async def compensation_command(interaction: discord.Interaction, member: discord.Member,
+                               amount: str, reason: str):
+    if not interaction.guild:
+        await interaction.response.send_message("Use this in the server.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    await db_execute(
+        "INSERT INTO compensations(guild_id, user_id, amount, reason, granted_by) VALUES ($1,$2,$3,$4,$5)",
+        interaction.guild.id, member.id, amount, reason, interaction.user.id)
+
+    role_note = ""
+    if COMPENSATION_ROLE_ID:
+        role = interaction.guild.get_role(COMPENSATION_ROLE_ID)
+        if role and role not in member.roles:
+            try:
+                await member.add_roles(role, reason=f"Compensation: {reason}")
+                role_note = f" • granted {role.mention}"
+            except Exception as e:
+                print("Compensation role grant failed:", e)
+
+    try:
+        await member.send(embed=discord.Embed(
+            title="🎁  A little something from AF SERVICES",
+            description=(f"We've applied **{amount}** to your account.\n**Reason:** {reason}\n\n"
+                         "Thank you for your patience — reach out any time. 💙"),
+            color=0x2ECC71))
+        dm = "DM sent"
+    except Exception:
+        dm = "couldn't DM the customer"
+
+    log_ch = await get_log_channel(interaction.guild)
+    if log_ch:
+        le = discord.Embed(title="🎁 Compensation Granted", color=0x2ECC71)
+        le.add_field(name="Customer", value=f"{member.mention} (`{member.id}`)", inline=False)
+        le.add_field(name="Amount", value=amount, inline=True)
+        le.add_field(name="Reason", value=reason, inline=True)
+        le.add_field(name="By", value=interaction.user.mention, inline=True)
+        await log_ch.send(embed=le)
+
+    await interaction.followup.send(
+        f"✅ Logged compensation for {member.mention}: **{amount}** — {reason}.{role_note} ({dm}).",
+        ephemeral=True)
+
+
+@bot.tree.command(name="verifyproof",
+                  description="Override: accept the proof and forward this ticket to the owner (staff).")
+@staff_only()
+async def verifyproof_command(interaction: discord.Interaction):
+    if not interaction.guild or not isinstance(interaction.channel, discord.TextChannel) \
+            or not isinstance(interaction.user, discord.Member):
+        await interaction.response.send_message("Use this in a ticket channel.", ephemeral=True)
+        return
+    row = await db_fetchrow("SELECT 1 FROM tickets WHERE channel_id=$1", interaction.channel.id)
+    if not row:
+        await interaction.response.send_message("This is not a ticket channel.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    await db_execute("UPDATE tickets SET awaiting_proof=FALSE WHERE channel_id=$1", interaction.channel.id)
+    await interaction.channel.send(
+        f"✅ Proof manually accepted by {interaction.user.mention}.")
+    ok, msg = await forward_ticket_flow(interaction.channel, interaction.user)
+    await interaction.followup.send(msg, ephemeral=True)
 
 
 # ============================================================
@@ -4265,6 +4491,95 @@ async def status_rotator():
 
 
 # ============================================================
+# BACKGROUND HOUSEKEEPING LOOPS
+# ============================================================
+@tasks.loop(minutes=30)
+async def review_reminder_loop():
+    """DM buyers a review reminder some hours after delivery (once)."""
+    if REVIEW_REMINDER_HOURS <= 0:
+        return
+    rows = await db_fetch(
+        "SELECT id, owner_id FROM deliveries WHERE review_reminded=FALSE "
+        "AND delivered_at < NOW() - make_interval(hours => $1) "
+        "AND delivered_at > NOW() - INTERVAL '3 days' LIMIT 20",
+        max(1, int(REVIEW_REMINDER_HOURS)))
+    reps = f"<#{REPS_CHANNEL_ID}>" if REPS_CHANNEL_ID else "our reviews channel"
+    for r in rows:
+        await db_execute("UPDATE deliveries SET review_reminded=TRUE WHERE id=$1", r["id"])
+        try:
+            user = await bot.fetch_user(int(r["owner_id"]))
+            await user.send(embed=discord.Embed(
+                title="⭐  Enjoying your account?",
+                description=(f"If everything's working great, we'd love a quick **+rep** in "
+                            f"{reps} — it really helps us out! 💙\n\nHaving any issues? Just open "
+                            f"a ticket and we'll sort it."),
+                color=AF_BLUE))
+        except Exception as e:
+            print("Review reminder DM failed:", e)
+
+
+@tasks.loop(minutes=30)
+async def idle_close_loop():
+    """Auto-close tickets idle beyond IDLE_CLOSE_HOURS (skips forwarded ones)."""
+    if IDLE_CLOSE_HOURS <= 0:
+        return
+    guild = bot.get_guild(GUILD_ID)
+    if not guild:
+        return
+    rows = await db_fetch(
+        "SELECT channel_id FROM tickets WHERE guild_id=$1 AND status='open' "
+        "AND forwarded_to_owner=FALSE AND last_activity < NOW() - make_interval(hours => $2) LIMIT 25",
+        guild.id, max(1, int(IDLE_CLOSE_HOURS)))
+    for r in rows:
+        ch = guild.get_channel(int(r["channel_id"]))
+        if isinstance(ch, discord.TextChannel):
+            try:
+                await ch.send(f"💤 This ticket has been inactive for over "
+                              f"**{int(IDLE_CLOSE_HOURS)}h** — closing it automatically. "
+                              f"Open a new ticket any time!")
+                await close_ticket_flow(ch, closed_by="Auto (inactivity)",
+                                        reason=f"Inactive > {int(IDLE_CLOSE_HOURS)}h")
+            except Exception as e:
+                print("Idle auto-close failed:", e)
+
+
+_low_stock_alerted: set[str] = set()
+
+
+@tasks.loop(minutes=60)
+async def low_stock_loop():
+    """Alert staff when valid stock in a category drops below the threshold (once per dip)."""
+    if not (LZT_ENABLED and LOW_STOCK_THRESHOLD > 0):
+        return
+    guild = bot.get_guild(GUILD_ID)
+    if not guild:
+        return
+    used = await _delivered_item_ids()
+    target = guild.get_channel(RESTOCK_CHANNEL_ID) if RESTOCK_CHANNEL_ID else None
+    if not isinstance(target, discord.TextChannel):
+        target = await get_log_channel(guild)
+    for cat in LOW_STOCK_CATEGORIES:
+        res = await lzt_find_valid(cat)
+        if not res["ok"]:
+            continue
+        avail = [it for it in res["items"]
+                 if int(re.sub(r"[^0-9]", "", str(it["item_id"])) or 0) not in used]
+        n = len(avail)
+        if n < LOW_STOCK_THRESHOLD:
+            if cat in _low_stock_alerted:
+                continue
+            _low_stock_alerted.add(cat)
+            if isinstance(target, discord.TextChannel):
+                await target.send(embed=discord.Embed(
+                    title="📉  Low Stock Alert",
+                    description=(f"Only **{n}** valid **{cat.title()}** account(s) left "
+                                f"(threshold {LOW_STOCK_THRESHOLD}). Time to restock."),
+                    color=0xE67E22))
+        else:
+            _low_stock_alerted.discard(cat)
+
+
+# ============================================================
 # READY
 # ============================================================
 @bot.event
@@ -4302,6 +4617,9 @@ async def on_ready():
 
     if not status_rotator.is_running():
         status_rotator.start()
+    for loop in (review_reminder_loop, idle_close_loop, low_stock_loop):
+        if not loop.is_running():
+            loop.start()
 
     print(f"✅ Ticket bot online as {bot.user}")
     print(f"🖼️  Asset dir: {ASSET_DIR}")
