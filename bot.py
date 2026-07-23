@@ -131,10 +131,49 @@ LZT_CATEGORY_IDS = {
 LZT_BAD_TAGS = {"invalid", "resold"}
 
 # Customer-facing category -> LZT.market search URL slug (for browsing listings to resell).
+# Not limited to Valorant/Fortnite — the AI can shop any of these on LZT.
 LZT_MARKET_SLUGS = {
-    "valorant": "riot",   # riot category (13) holds Valorant + LoL
+    "valorant": "riot",     # riot category holds Valorant + LoL
+    "lol": "riot",
     "fortnite": "fortnite",
+    "steam": "steam",
+    "rockstar": "socialclub",   # GTA V / RDR2 / Social Club
+    "gta": "socialclub",
+    "socialclub": "socialclub",
+    "epicgames": "epicgames",
+    "epic": "epicgames",
+    "minecraft": "minecraft",
+    "roblox": "roblox",
+    "ea": "origin",
+    "origin": "origin",
+    "ubisoft": "uplay",
+    "uplay": "uplay",
+    "battlenet": "battlenet",
+    "chatgpt": "chatgpt",
+    "supercell": "supercell",
+    "telegram": "telegram",
+    "discord": "discord",
+    "tiktok": "tiktok",
+    "genshin": "mihoyo",
+    "mihoyo": "mihoyo",
+    "tarkov": "escape-from-tarkov",
+    "wot": "world-of-tanks",
+    "spotify": "spotify",
 }
+# Nicer display labels for the categories above.
+LZT_GAME_LABELS = {
+    "valorant": "Valorant", "lol": "League of Legends", "fortnite": "Fortnite",
+    "steam": "Steam", "rockstar": "Rockstar / GTA", "gta": "GTA", "socialclub": "Rockstar",
+    "epicgames": "Epic Games", "epic": "Epic Games", "minecraft": "Minecraft", "roblox": "Roblox",
+    "ea": "EA App", "origin": "EA / Origin", "ubisoft": "Ubisoft", "uplay": "Ubisoft",
+    "battlenet": "Battle.net", "chatgpt": "ChatGPT", "supercell": "Supercell",
+    "telegram": "Telegram", "discord": "Discord", "tiktok": "TikTok", "genshin": "Genshin Impact",
+    "mihoyo": "miHoYo", "tarkov": "Escape from Tarkov", "wot": "World of Tanks", "spotify": "Spotify",
+}
+
+
+def game_label(key: str) -> str:
+    return LZT_GAME_LABELS.get((key or "").lower(), (key or "Account").title())
 # Resale markup: we sell to the customer at >= this multiple of the LZT source price.
 RESALE_MULTIPLIER = float(os.getenv("RESALE_MULTIPLIER", "2.5") or "2.5")
 # Where "buy this now to restock" alerts go. If unset, the alert DMs the staff who triggered it.
@@ -543,10 +582,14 @@ def _spent_metric(category: str, item: dict) -> int:
     Valorant → VP value of the skin inventory; Fortnite → V-Bucks spent in shop.
     Used to rank market listings so the customer gets the richest account their
     budget allows."""
-    if category.lower() == "valorant":
+    c = category.lower()
+    if c == "valorant":
         return int(item.get("riot_valorant_inventory_value") or 0)
-    return sum(int(item.get(f"fortnite_shop_{k}_cost") or 0)
-               for k in ("skins", "pickaxes", "dances", "gliders"))
+    if c == "fortnite":
+        return sum(int(item.get(f"fortnite_shop_{k}_cost") or 0)
+                   for k in ("skins", "pickaxes", "dances", "gliders"))
+    # Other games have no universal "spent" metric — rank by price (richest first).
+    return int(float(item.get("price") or 0) * 100)
 
 
 async def lzt_search_market(category: str, budget: float | None = None,
@@ -766,6 +809,37 @@ async def build_cosmetic_sections(category: str, item: dict) -> dict[str, list[s
     return sections
 
 
+_GENERIC_STAT_FIELDS = [
+    # (label, list-of-candidate-keys) — shown when present on the listing.
+    ("Level", ["steam_level", "account_level", "level"]),
+    ("Games", ["steam_game_count", "steam_full_games_count", "game_count"]),
+    ("Balance", ["steam_balance", "balance", "account_balance"]),
+    ("Country", ["steam_country", "account_country", "country"]),
+    ("Last seen", ["account_last_activity", "steam_last_activity"]),
+]
+
+
+def _generic_account_embed(category: str, item: dict) -> discord.Embed:
+    """A category-agnostic account card for any LZT game (Steam, Rockstar, EA, …).
+    Uses the listing's own title + whatever common stat fields are present."""
+    label = game_label(category)
+    if category.lower() in ("generic", "account") or label.lower() == "generic":
+        cat = item.get("category") or {}
+        label = str(cat.get("category_name") or cat.get("title") or "Account")
+    title = item.get("title") or item.get("title_en") or f"{label} Account"
+    e = discord.Embed(title=f"🎮  {label} Account",
+                      description=str(title)[:600], color=AF_BLUE)
+    shown = 0
+    for name, keys in _GENERIC_STAT_FIELDS:
+        val = next((item.get(k) for k in keys if item.get(k) not in (None, "", 0)), None)
+        if val is not None:
+            e.add_field(name=name, value=str(val)[:64], inline=True)
+            shown += 1
+        if shown >= 5:
+            break
+    return e
+
+
 def market_account_embed(category: str, item: dict, image_name: str | None = None,
                          valorant_skin_names: list[str] | None = None) -> discord.Embed:
     """Customer-facing embed describing one account: stats + skins image + price.
@@ -801,7 +875,7 @@ def market_account_embed(category: str, item: dict, image_name: str | None = Non
             if more > 0:
                 skin_list += f"\n…and **{more}** more — tap **View all skins** below"
             e.add_field(name="🎨 Skin List", value=skin_list[:1024], inline=False)
-    else:  # fortnite
+    elif category.lower() == "fortnite":
         skins = item.get("fortnite_skin_count") or 0
         vbucks = item.get("fortnite_balance") or 0
         spent = sum(int(item.get(f"fortnite_shop_{k}_cost") or 0)
@@ -821,6 +895,8 @@ def market_account_embed(category: str, item: dict, image_name: str | None = Non
             color=GUIDE_EPIC_COLOR,
         )
         e.add_field(name="🎨 Skins", value=skin_list[:1024], inline=False)
+    else:  # any other LZT category — render generically from the listing
+        e = _generic_account_embed(category, item)
 
     e.add_field(name="💶 Price", value=f"**€{resale:.0f}**", inline=True)
     if image_name:
@@ -2417,6 +2493,18 @@ async def deliver_next_command(interaction: discord.Interaction, category: app_c
 MARKET_CATEGORY_CHOICES = [
     app_commands.Choice(name="Valorant", value="valorant"),
     app_commands.Choice(name="Fortnite", value="fortnite"),
+    app_commands.Choice(name="Steam", value="steam"),
+    app_commands.Choice(name="Rockstar / GTA", value="rockstar"),
+    app_commands.Choice(name="Epic Games", value="epicgames"),
+    app_commands.Choice(name="EA App", value="ea"),
+    app_commands.Choice(name="Ubisoft", value="ubisoft"),
+    app_commands.Choice(name="Battle.net", value="battlenet"),
+    app_commands.Choice(name="Minecraft", value="minecraft"),
+    app_commands.Choice(name="Roblox", value="roblox"),
+    app_commands.Choice(name="League of Legends", value="lol"),
+    app_commands.Choice(name="Genshin Impact", value="genshin"),
+    app_commands.Choice(name="ChatGPT", value="chatgpt"),
+    app_commands.Choice(name="Supercell", value="supercell"),
 ]
 
 
@@ -2424,7 +2512,7 @@ MARKET_MAX_SCAN = 20  # cap on detail lookups when filtering by skin
 
 
 @bot.tree.command(name="market",
-                  description="Browse Valorant/Fortnite accounts available to buy, within a budget.")
+                  description="Browse accounts available to buy on any supported game, within a budget.")
 @app_commands.describe(
     category="Game the customer wants",
     budget="Customer's max budget in EUR (optional — we find accounts that fit)",
@@ -2460,16 +2548,18 @@ async def market_command(interaction: discord.Interaction, category: app_command
         det = await lzt_item_detail(it.get("item_id") or it.get("id"))
         scanned += 1
         item = det["item"] if det["ok"] else it
-        if wanted:
+        # Skin filtering only applies to games with cosmetic lists (Valorant/Fortnite).
+        if wanted and category.value in ("valorant", "fortnite"):
             sections = await build_cosmetic_sections(category.value, item)
             owned = [n.lower() for names in sections.values() for n in names]
             if not all(any(w.lower() in n for n in owned) for w in wanted):
                 continue
         chosen.append(item)
 
+    cosmetic_game = category.value in ("valorant", "fortnite")
     if not chosen:
         msg = f"No {category.name} accounts matched"
-        if wanted:
+        if wanted and cosmetic_game:
             msg += f" the skin(s): **{', '.join(wanted)}**"
         if budget:
             msg += f" under €{budget:.0f}"
@@ -2483,14 +2573,18 @@ async def market_command(interaction: discord.Interaction, category: app_command
         if file:
             files.append(file)
 
-    spent_label = "VP spent" if category.value == "valorant" else "V-Bucks spent"
-    header = f"🛍️ **{category.name} accounts available** — highest **{spent_label}** first"
-    if wanted:
+    if category.value == "valorant":
+        header = f"🛍️ **{category.name} accounts available** — highest **VP spent** first"
+    elif category.value == "fortnite":
+        header = f"🛍️ **{category.name} accounts available** — highest **V-Bucks spent** first"
+    else:
+        header = f"🛍️ **{category.name} accounts available** — best value first"
+    if wanted and cosmetic_game:
         header += f" · matching **{', '.join(wanted)}**"
     if budget:
         header += f" · within a **€{budget:.0f}** budget"
 
-    view = skins_view_for(chosen, category.value)
+    view = skins_view_for(chosen, category.value) if cosmetic_game else None
     kwargs = {"content": header, "embeds": embeds[:10], "files": files}
     if view is not None:
         kwargs["view"] = view
@@ -2508,14 +2602,10 @@ async def account_info_command(interaction: discord.Interaction, item_id: str):
         return
     item = det["item"] or {}
     cid = (item.get("category") or {}).get("category_id") or item.get("category_id")
-    category = "valorant" if cid == 13 else "fortnite" if cid == 9 else None
-    if category is None:
-        await interaction.followup.send(
-            "ℹ️ That account isn't a Valorant or Fortnite account, so I can't render its stats.",
-            ephemeral=True)
-        return
+    # Render Valorant/Fortnite richly; every other LZT category renders generically.
+    category = "valorant" if cid == 13 else "fortnite" if cid == 9 else "generic"
     embed, file = await build_account_message(category, item, 0)
-    view = skins_view_for([item], category)
+    view = skins_view_for([item], category) if category in ("valorant", "fortnite") else None
     kwargs = {"embed": embed, "files": [file] if file else []}
     if view is not None:
         kwargs["view"] = view
@@ -3607,10 +3697,12 @@ def make_buy_intro_embed() -> discord.Embed:
         description=(
             "Tell me what you'd like to buy and your **budget**, and I'll pull up matching "
             "accounts right away.\n\n"
-            "We currently stock **Valorant** and **Fortnite** accounts.\n\n"
+            "We stock **Valorant, Fortnite, Steam, Rockstar/GTA, EA, Ubisoft, Battle.net, "
+            "Minecraft, Roblox, LoL, Genshin, ChatGPT** and more.\n\n"
             "**For example:**\n"
             "> *\"A Valorant account with some skins, around €25\"*\n"
-            "> *\"Fortnite account with OG skins, budget 40 euros\"*\n\n"
+            "> *\"Steam account with a few games, budget €30\"*\n"
+            "> *\"GTA V / Rockstar account, around €20\"*\n\n"
             f"{DIVIDER}\nJust type your request below 👇"
         ),
         color=AF_BLUE,
@@ -3695,17 +3787,18 @@ async def present_accounts(channel: discord.TextChannel, game: str, budget: floa
         det = await lzt_item_detail(it.get("item_id") or it.get("id"))
         scanned += 1
         item = det["item"] if det["ok"] else it
-        if wanted:
+        # Skin filtering only applies to games with cosmetic lists (Valorant/Fortnite).
+        if wanted and game in ("valorant", "fortnite"):
             sections = await build_cosmetic_sections(game, item)
             owned = [n.lower() for names in sections.values() for n in names]
             if not all(any(w.lower() in n for n in owned) for w in wanted):
                 continue
         chosen.append(item)
     if not chosen:
-        extra = f" matching {', '.join(wanted)}" if wanted else ""
+        extra = f" matching {', '.join(wanted)}" if (wanted and game in ("valorant", "fortnite")) else ""
         await channel.send(
-            f"I couldn't find a {game.title()} account{extra} within that budget right now. "
-            f"Try a higher budget or different skins, or a staff member can source one for you.")
+            f"I couldn't find a {game_label(game)} account{extra} within that budget right now. "
+            f"Try a higher budget, or a staff member can source one for you.")
         return 0
 
     embeds, files, offers = [], [], []
@@ -3721,10 +3814,10 @@ async def present_accounts(channel: discord.TextChannel, game: str, budget: floa
                        "title": item.get("title") or "Account", "game": game})
     shop_offers[channel.id] = offers
 
-    view = skins_view_for(chosen, game)
+    view = skins_view_for(chosen, game) if game in ("valorant", "fortnite") else None
     kwargs = {
         "content": "Here are the best matches 👇 Reply with the **number** of the one you want, "
-                   "or ask me to adjust the budget/skins.",
+                   "or ask me to adjust the budget.",
         "embeds": embeds[:10], "files": files,
     }
     if view is not None:
@@ -3733,36 +3826,56 @@ async def present_accounts(channel: discord.TextChannel, game: str, budget: floa
     return len(offers)
 
 
-AI_SHOP_PROMPT = (
-    "You are the shopping assistant for AF SERVICES, a Discord shop that sells Valorant and "
-    "Fortnite accounts. You talk to a customer in their ticket and drive the whole flow: "
-    "understand what they want, show accounts, take their pick, and start checkout. We ONLY "
-    "stock Valorant and Fortnite — politely decline anything else.\n\n"
-    "IMPORTANT RULES:\n"
-    "- NEVER invent account details, skins, or prices. The system shows real accounts.\n"
-    "- NEVER reveal or promise account logins/credentials — the OWNER always delivers those "
-    "after payment. You only take the order up to payment/proof.\n"
-    "- Card payments include a surcharge; the system computes the exact total — don't quote a "
-    "card total yourself, just say card has a small fee and let the system post it.\n"
-    "- Be warm, concise, human.\n\n"
-    "Each turn, respond with ONLY a JSON object (no prose around it):\n"
-    "{\n"
-    '  "reply": "<message to the customer>",\n'
-    '  "action": "none" | "search" | "select" | "checkout",\n'
-    '  "game": "valorant" | "fortnite" | null,\n'
-    '  "budget": <number|null>,          // EUR, for search\n'
-    '  "skins": [<string>, ...] | null,  // optional specific skins they asked for\n'
-    '  "index": <number|null>,           // which shown account they picked (1-based)\n'
-    '  "method": "crypto" | "card" | null // for checkout\n'
-    "}\n\n"
-    "Flow:\n"
-    "1. Missing game or budget → action \"none\", ask for it.\n"
-    "2. Have game + budget (and any skins) → action \"search\" (reply: tell them you're pulling options).\n"
-    "3. They pick one (e.g. 'the 2nd', '#1') → action \"select\" with index (reply: confirm the pick, "
-    "ask whether they want to pay by crypto or card).\n"
-    "4. They choose a method → action \"checkout\" with method (reply: tell them the checkout is below).\n"
-    "Only set action to search/select/checkout when that step is actually reached; otherwise \"none\"."
-)
+AI_SHOP_GAME_KEYS = sorted(set(LZT_MARKET_SLUGS.keys()))
+
+
+def _build_ai_shop_prompt() -> str:
+    games = ", ".join(f"{k} ({game_label(k)})" for k in AI_SHOP_GAME_KEYS)
+    return (
+        "You are the shopping assistant for AF SERVICES, a Discord shop that sells gaming and "
+        "digital accounts sourced from a large marketplace. You talk to a customer in their "
+        "ticket and drive the whole flow: understand what they want, show accounts, take their "
+        "pick, and start checkout.\n\n"
+        "SUPPORTED GAMES/PLATFORMS (use the KEY on the left as the \"game\" value):\n"
+        f"{games}\n"
+        "Map the customer's words to the closest key (e.g. 'GTA' or 'rockstar' → rockstar, "
+        "'LoL' → lol, 'EA'/'FIFA'/'Origin' → ea, 'CoD'/'Overwatch' → battlenet). If they ask "
+        "for something NOT in this list, politely say we don't currently stock it and list a few "
+        "we do have.\n\n"
+        "IMPORTANT RULES:\n"
+        "- NEVER invent account details, skins, or prices. The system shows real accounts.\n"
+        "- NEVER reveal or promise account logins/credentials — the OWNER always delivers those "
+        "after payment. You only take the order up to payment/proof.\n"
+        "- Card payments include a surcharge; the system computes the exact total — don't quote a "
+        "card total yourself, just say card has a small fee and let the system post it.\n"
+        "- 'skins' only matters for valorant/fortnite; ignore it for other games.\n"
+        "- Be warm, concise, human.\n\n"
+        "Each turn, respond with ONLY a JSON object (no prose around it):\n"
+        "{\n"
+        '  "reply": "<message to the customer>",\n'
+        '  "action": "none" | "search" | "select" | "checkout",\n'
+        '  "game": "<one of the KEYS above>" | null,\n'
+        '  "budget": <number|null>,          // EUR, for search\n'
+        '  "skins": [<string>, ...] | null,  // valorant/fortnite only\n'
+        '  "index": <number|null>,           // which shown account they picked (1-based)\n'
+        '  "method": "crypto" | "card" | null // for checkout\n'
+        "}\n\n"
+        "Flow:\n"
+        "1. Missing game or budget → action \"none\", ask for it.\n"
+        "2. Have game + budget → action \"search\" (reply: tell them you're pulling options).\n"
+        "3. They pick one (e.g. 'the 2nd', '#1') → action \"select\" with index (reply: confirm the "
+        "pick, ask whether they want to pay by crypto or card).\n"
+        "4. They choose a method → action \"checkout\" with method (reply: tell them the checkout is below).\n"
+        "CRITICAL: Always use the customer's MOST RECENT budget and game. If they change the budget "
+        "or game at ANY point — even after you've already shown options or they picked one (e.g. they "
+        "first said €1.3 then say €20, or switch from Valorant to Steam) — treat it as a brand-new "
+        "search: set action \"search\" with the UPDATED budget/game and show fresh matches. Never keep "
+        "using an old budget.\n"
+        "Only set action to search/select/checkout when that step is actually reached; otherwise \"none\"."
+    )
+
+
+AI_SHOP_PROMPT = _build_ai_shop_prompt()
 
 
 async def run_ai_shopping(channel: discord.TextChannel, owner: discord.abc.User) -> None:
