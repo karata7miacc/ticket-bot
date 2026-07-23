@@ -3877,13 +3877,67 @@ async def refresh_ticket_control_message(channel: discord.TextChannel):
 # ============================================================
 # CLOSE FLOW
 # ============================================================
+# A leading +rep / -rep tag (tolerant of a space: "+ rep", "-rep …").
+_PLUS_REP_RE = re.compile(r"(?:^|[^\w])\+\s?rep\b", re.IGNORECASE)
+_MINUS_REP_RE = re.compile(r"(?:^|[^\w])[-–—]\s?rep\b", re.IGNORECASE)
+
+NEG_REVIEW_SYSTEM = (
+    "You are a caring customer-support agent for AF SERVICES, a gaming-account shop. A customer "
+    "just left a NEGATIVE review. Read it, briefly and specifically acknowledge their complaint, "
+    "sincerely apologize, and invite them to open a support ticket (or reply here) so the team "
+    "can make it right — mention we'd like to offer compensation appropriate to their issue. "
+    "Warm and human, 2-3 sentences, no exact figures or over-promising."
+)
+
+
+async def _reply_negative_review(message: discord.Message) -> None:
+    """Read a -rep and reply with an empathetic compensation-outreach message."""
+    text = (message.content or "").strip()
+    reply = None
+    if AI_ENABLED and anthropic_client and text:
+        try:
+            resp = await anthropic_client.messages.create(
+                model=AI_MODEL, max_tokens=250, system=NEG_REVIEW_SYSTEM,
+                messages=[{"role": "user", "content": text[:1500]}])
+            reply = "".join(b.text for b in resp.content
+                            if getattr(b, "type", "") == "text").strip()
+        except Exception as e:
+            print("Negative-review AI reply failed:", e)
+    if not reply:
+        reply = ("We're really sorry your experience wasn't perfect. Please open a support ticket "
+                 "or reply here so we can make it right — we'd like to offer you compensation "
+                 "depending on the issue. 🙏")
+    try:
+        await message.reply(reply[:1900], mention_author=True)
+    except Exception as e:
+        print("Negative-review reply send failed:", e)
+
+
 async def handle_review_post(message: discord.Message) -> None:
-    """A customer left a review in the reps channel: give them the customer role and
-    auto-close any open ticket(s) they own."""
+    """Handle a post in the reviews/reps channel.
+    -rep → read it and reply offering compensation (keep the ticket OPEN).
+    otherwise (a +rep or plain review) → ❤️ react (on +rep), grant the customer
+    role, and auto-close the customer's open ticket(s)."""
     guild = message.guild
     member = message.author
     if guild is None or not isinstance(member, discord.Member):
         return
+
+    content = message.content or ""
+    is_plus = bool(_PLUS_REP_RE.search(content))
+    is_minus = bool(_MINUS_REP_RE.search(content))
+
+    # Negative review → outreach, and leave everything open so we can help them.
+    if is_minus and not is_plus:
+        await _reply_negative_review(message)
+        return
+
+    # Positive review → heart it.
+    if is_plus:
+        try:
+            await message.add_reaction("❤️")
+        except Exception as e:
+            print("Review react failed:", e)
 
     # Grant the customer role (skip staff — they don't need it).
     if CUSTOMER_ROLE_ID and not is_staff(member):
