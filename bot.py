@@ -809,6 +809,53 @@ async def build_cosmetic_sections(category: str, item: dict) -> dict[str, list[s
     return sections
 
 
+# Community nicknames → official in-game name substrings. When a customer asks
+# for a cosmetic by its common name, we match any of the real names it maps to.
+# (e.g. "FNCS pickaxe" → every "Axe of Champions" variant: I, II, III, …)
+_COSMETIC_ALIASES: list[tuple[list[str], list[str]]] = [
+    (["fncs", "axe of champion", "champion axe", "champions axe", "fncs axe", "fncs pickaxe",
+      "fncs pick"], ["axe of champions"]),
+    (["renegade"], ["renegade raider"]),
+    (["aerial assault", "aat"], ["aerial assault trooper"]),
+    (["skull trooper"], ["skull trooper"]),
+    (["ghoul"], ["ghoul trooper"]),
+    (["black knight"], ["black knight"]),
+    (["reaper", "john wick"], ["the reaper", "reaper"]),
+    (["take the l", "take the elle"], ["take the l"]),
+    (["floss"], ["floss"]),
+    (["merry mint", "mint axe", "minty", "minty pickaxe", "minty axe"], ["merry mint axe"]),
+    (["star wand", "star wand pickaxe"], ["star wand"]),
+    (["candy axe"], ["candy axe"]),
+    (["reaper pickaxe", "harvesting tool"], ["reaper"]),
+]
+
+
+def _expand_skin_query(term: str) -> list[str]:
+    """Expand a requested cosmetic term into official-name substrings to match."""
+    t = (term or "").strip().lower()
+    if not t:
+        return []
+    out = [t]
+    for triggers, targets in _COSMETIC_ALIASES:
+        if any(trig in t or t in trig for trig in triggers):
+            out.extend(targets)
+    seen, res = set(), []
+    for c in out:
+        c = c.strip()
+        if c and c not in seen:
+            seen.add(c)
+            res.append(c)
+    return res
+
+
+def _cosmetic_matches(owned_lower: list[str], term: str) -> bool:
+    """True if the account owns a cosmetic matching the requested term (via aliases)."""
+    for cand in _expand_skin_query(term):
+        if any(cand in n for n in owned_lower):
+            return True
+    return False
+
+
 _GENERIC_STAT_FIELDS = [
     # (label, list-of-candidate-keys) — shown when present on the listing.
     ("Level", ["steam_level", "account_level", "level"]),
@@ -2552,7 +2599,7 @@ async def market_command(interaction: discord.Interaction, category: app_command
         if wanted and category.value in ("valorant", "fortnite"):
             sections = await build_cosmetic_sections(category.value, item)
             owned = [n.lower() for names in sections.values() for n in names]
-            if not all(any(w.lower() in n for n in owned) for w in wanted):
+            if not all(_cosmetic_matches(owned, w) for w in wanted):
                 continue
         chosen.append(item)
 
@@ -3791,7 +3838,7 @@ async def present_accounts(channel: discord.TextChannel, game: str, budget: floa
         if wanted and game in ("valorant", "fortnite"):
             sections = await build_cosmetic_sections(game, item)
             owned = [n.lower() for names in sections.values() for n in names]
-            if not all(any(w.lower() in n for n in owned) for w in wanted):
+            if not all(_cosmetic_matches(owned, w) for w in wanted):
                 continue
         chosen.append(item)
     if not chosen:
@@ -3849,6 +3896,11 @@ def _build_ai_shop_prompt() -> str:
         "- Card payments include a surcharge; the system computes the exact total — don't quote a "
         "card total yourself, just say card has a small fee and let the system post it.\n"
         "- 'skins' only matters for valorant/fortnite; ignore it for other games.\n"
+        "- When the customer names a cosmetic by a community NICKNAME, translate it to the "
+        "OFFICIAL in-game name(s) in the skins array. Examples: 'FNCS pickaxe'/'FNCS axe' → "
+        "'Axe of Champions' (matches every FNCS axe: I, II, III…); 'minty'/'mint axe' → "
+        "'Merry Mint Axe'; 'renegade' → 'Renegade Raider'; 'AAT' → 'Aerial Assault Trooper'. "
+        "Always put the official name in skins, not the nickname.\n"
         "- Be warm, concise, human.\n\n"
         "Each turn, respond with ONLY a JSON object (no prose around it):\n"
         "{\n"
