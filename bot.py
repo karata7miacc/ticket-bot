@@ -3158,54 +3158,6 @@ async def myorders_command(interaction: discord.Interaction):
     await interaction.followup.send(embed=e, ephemeral=True)
 
 
-@bot.tree.command(name="compensation", description="Log & grant compensation to a customer (staff).")
-@staff_only()
-@app_commands.describe(member="The customer", amount="e.g. '€5 store credit' or '10% off'",
-                       reason="Why they're being compensated")
-async def compensation_command(interaction: discord.Interaction, member: discord.Member,
-                               amount: str, reason: str):
-    if not interaction.guild:
-        await interaction.response.send_message("Use this in the server.", ephemeral=True)
-        return
-    await interaction.response.defer(ephemeral=True)
-    await db_execute(
-        "INSERT INTO compensations(guild_id, user_id, amount, reason, granted_by) VALUES ($1,$2,$3,$4,$5)",
-        interaction.guild.id, member.id, amount, reason, interaction.user.id)
-
-    role_note = ""
-    if COMPENSATION_ROLE_ID:
-        role = interaction.guild.get_role(COMPENSATION_ROLE_ID)
-        if role and role not in member.roles:
-            try:
-                await member.add_roles(role, reason=f"Compensation: {reason}")
-                role_note = f" • granted {role.mention}"
-            except Exception as e:
-                print("Compensation role grant failed:", e)
-
-    try:
-        await member.send(embed=discord.Embed(
-            title="🎁  A little something from AF SERVICES",
-            description=(f"We've applied **{amount}** to your account.\n**Reason:** {reason}\n\n"
-                         "Thank you for your patience — reach out any time. 💙"),
-            color=0x2ECC71))
-        dm = "DM sent"
-    except Exception:
-        dm = "couldn't DM the customer"
-
-    log_ch = await get_log_channel(interaction.guild)
-    if log_ch:
-        le = discord.Embed(title="🎁 Compensation Granted", color=0x2ECC71)
-        le.add_field(name="Customer", value=f"{member.mention} (`{member.id}`)", inline=False)
-        le.add_field(name="Amount", value=amount, inline=True)
-        le.add_field(name="Reason", value=reason, inline=True)
-        le.add_field(name="By", value=interaction.user.mention, inline=True)
-        await log_ch.send(embed=le)
-
-    await interaction.followup.send(
-        f"✅ Logged compensation for {member.mention}: **{amount}** — {reason}.{role_note} ({dm}).",
-        ephemeral=True)
-
-
 @bot.tree.command(name="verifyproof",
                   description="Override: accept the proof and forward this ticket to the owner (staff).")
 @staff_only()
