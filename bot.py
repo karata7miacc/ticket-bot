@@ -1062,10 +1062,38 @@ async def np_get_payment(payment_id: str) -> dict:
     return out
 
 
+def _extract_email_access(item: dict, login_data: dict) -> tuple[str | None, str | None, str | None]:
+    """Best-effort (email_login, email_password, email_raw) for the account's
+    inbox, so the buyer can pull verification codes. LZT exposes this under a few
+    different keys depending on the listing, so probe each."""
+    email_login = email_password = email_raw = None
+    blob = (item.get("emailLoginData") or item.get("email_login_data")
+            or login_data.get("emailLoginData") or login_data.get("email_login_data"))
+    if isinstance(blob, str) and blob.strip():
+        email_raw = blob.strip()
+        if ":" in email_raw:
+            email_login, _, email_password = email_raw.partition(":")
+    elif isinstance(blob, dict):
+        email_login = blob.get("login") or blob.get("email")
+        email_password = blob.get("password")
+        email_raw = blob.get("raw")
+    # Fallbacks on flat item / loginData fields.
+    email_login = (email_login or item.get("email") or item.get("email_login")
+                   or login_data.get("email") or login_data.get("email_login"))
+    email_password = (email_password or item.get("email_password")
+                      or login_data.get("email_password"))
+    if not email_raw and email_login and email_password:
+        email_raw = f"{email_login}:{email_password}"
+    return email_login, email_password, email_raw
+
+
 async def lzt_get_credentials(item_id: str | int) -> dict:
-    """Fetch the login credentials for one owned LZT item.
-    Returns {ok, login, password, raw, title, error}."""
-    out = {"ok": False, "login": None, "password": None, "raw": None, "title": None, "error": None}
+    """Fetch the login credentials for one owned LZT item, including email (inbox)
+    access when the listing provides it.
+    Returns {ok, login, password, raw, email_login, email_password, email_raw, title, error}."""
+    out = {"ok": False, "login": None, "password": None, "raw": None,
+           "email_login": None, "email_password": None, "email_raw": None,
+           "title": None, "error": None}
     if not LZT_ENABLED:
         out["error"] = "stock source not configured"
         return out
@@ -1098,7 +1126,9 @@ async def lzt_get_credentials(item_id: str | int) -> dict:
         out["error"] = "no credentials returned (item may not be owned, or token lacks scope)"
         return out
 
+    email_login, email_password, email_raw = _extract_email_access(item, login_data)
     out.update(ok=True, login=login, password=password, raw=raw,
+               email_login=email_login, email_password=email_password, email_raw=email_raw,
                title=item.get("title") or item.get("title_en"))
     return out
 
@@ -1114,7 +1144,9 @@ async def order_already_delivered(order_id: str | None) -> bool:
 
 
 def credentials_embed(product: str | None, order_id: str | None,
-                      login: str | None, password: str | None, raw: str | None) -> discord.Embed:
+                      login: str | None, password: str | None, raw: str | None,
+                      email_login: str | None = None, email_password: str | None = None,
+                      email_raw: str | None = None) -> discord.Embed:
     body = "Here is your account. **Tap the hidden field to reveal it**, then secure it immediately.\n\n"
     if login:
         body += f"**Login:** ||{login}||\n"
@@ -1122,6 +1154,17 @@ def credentials_embed(product: str | None, order_id: str | None,
         body += f"**Password:** ||{password}||\n"
     if raw and not (login and password):
         body += f"**Account:** ||{raw}||\n"
+
+    has_email = bool(email_login or email_raw)
+    if has_email:
+        body += "\n**📧 Email (inbox) access — for verification codes:**\n"
+        if email_login:
+            body += f"**Email:** ||{email_login}||\n"
+        if email_password:
+            body += f"**Email password:** ||{email_password}||\n"
+        if email_raw and not (email_login and email_password):
+            body += f"**Email login:** ||{email_raw}||\n"
+
     body += "\nFollow **/guide** to lock the account to you (change email/password, enable 2FA)."
 
     e = discord.Embed(title="📦  Your Account — Delivered", description=body, color=0x2ECC71)
@@ -1181,7 +1224,9 @@ async def deliver_account(
         return False
 
     embed = credentials_embed(product or creds.get("title"), order_id,
-                              creds["login"], creds["password"], creds["raw"])
+                              creds["login"], creds["password"], creds["raw"],
+                              creds.get("email_login"), creds.get("email_password"),
+                              creds.get("email_raw"))
     await channel.send(content=owner.mention, embed=embed, files=embed_files())
     try:
         await owner.send(embed=embed)  # also DM the buyer as a backup copy
