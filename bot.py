@@ -1483,25 +1483,16 @@ def _fetch_emails_sync(host: str, address: str, password: str, limit: int) -> di
             pass
 
 
-async def fetch_account_emails(item_id: str | int, limit: int = 25) -> dict:
-    """Read the newest inbox letters for an owned account. Returns
+async def read_inbox(address: str, password: str, limit: int = 25) -> dict:
+    """Read the newest inbox letters for a given email:pass. Returns
     {ok, address, messages, error}."""
-    out = {"ok": False, "address": None, "messages": [], "error": None}
+    out = {"ok": False, "address": address, "messages": [], "error": None}
     if not EMAIL_LETTERS_ENABLED:
         out["error"] = "email reading is disabled"
         return out
-    creds = await lzt_get_credentials(item_id)
-    if not creds["ok"]:
-        out["error"] = creds["error"]
-        return out
-    address = creds.get("email_login")
-    password = creds.get("email_password")
-    if not (address and password) and creds.get("email_raw") and ":" in str(creds["email_raw"]):
-        address, _, password = str(creds["email_raw"]).partition(":")
     if not (address and password):
-        out["error"] = "this account has no email (inbox) access"
+        out["error"] = "missing email or password"
         return out
-    out["address"] = address
     host = _imap_host_for(address)
     try:
         res = await asyncio.wait_for(
@@ -1511,6 +1502,23 @@ async def fetch_account_emails(item_id: str | int, limit: int = 25) -> dict:
     except Exception as e:
         out["error"] = f"couldn't reach the inbox ({host}): {type(e).__name__}"
     return out
+
+
+async def fetch_account_emails(item_id: str | int, limit: int = 25) -> dict:
+    """Resolve an owned account's email:pass from LZT, then read its inbox."""
+    if not EMAIL_LETTERS_ENABLED:
+        return {"ok": False, "address": None, "messages": [], "error": "email reading is disabled"}
+    creds = await lzt_get_credentials(item_id)
+    if not creds["ok"]:
+        return {"ok": False, "address": None, "messages": [], "error": creds["error"]}
+    address = creds.get("email_login")
+    password = creds.get("email_password")
+    if not (address and password) and creds.get("email_raw") and ":" in str(creds["email_raw"]):
+        address, _, password = str(creds["email_raw"]).partition(":")
+    if not (address and password):
+        return {"ok": False, "address": None, "messages": [],
+                "error": "this account has no email (inbox) access"}
+    return await read_inbox(address, password, limit=limit)
 
 
 # Email domain → (provider name, webmail URL) for the "how to get codes" guide.
@@ -1566,11 +1574,13 @@ class EmailPager(discord.ui.View):
     """LZT-style inbox reader: paginated list of ALL letters + open any one in full."""
     PAGE = 8
 
-    def __init__(self, address: str, messages: list[dict], item_id: int | None = None):
+    def __init__(self, address: str, messages: list[dict], item_id: int | None = None,
+                 password: str | None = None):
         super().__init__(timeout=600)
         self.address = address
         self.messages = messages[:30]
         self.item_id = item_id
+        self.password = password
         self.page = 0
 
         self.prev_btn = discord.ui.Button(label="◀ Prev", style=discord.ButtonStyle.secondary)
@@ -1625,11 +1635,15 @@ class EmailPager(discord.ui.View):
 
     async def _refresh_btn(self, interaction: discord.Interaction):
         await interaction.response.defer()
-        newview = self
+        res = None
         if self.item_id:
             res = await fetch_account_emails(self.item_id)
-            if res["ok"]:
-                newview = EmailPager(res["address"] or self.address, res["messages"], self.item_id)
+        elif self.address and self.password:
+            res = await read_inbox(self.address, self.password)
+        newview = self
+        if res and res["ok"]:
+            newview = EmailPager(res["address"] or self.address, res["messages"],
+                                 self.item_id, self.password)
         await interaction.edit_original_response(embed=newview.render(), view=newview)
 
     async def _open(self, interaction: discord.Interaction):
@@ -3129,20 +3143,35 @@ async def restock_command(interaction: discord.Interaction, item_id: str):
 
 
 @bot.tree.command(name="email",
-                  description="Read an account's latest email letters / verification codes (staff).")
+                  description="Read email letters / verification codes — paste email:pass or an item ID (staff).")
 @staff_only()
-@app_commands.describe(item_id="The account item ID (see /stock)", count="How many letters (1-10)")
-async def email_command(interaction: discord.Interaction, item_id: str, count: int = 5):
+@app_commands.describe(account="email:pass  (e.g. bob@rambler.ru:pass123)  OR an account item ID",
+                       count="How many letters (1-30)")
+async def email_command(interaction: discord.Interaction, account: str, count: int = 10):
     if not EMAIL_LETTERS_ENABLED:
         await interaction.response.send_message("Email reading is disabled.", ephemeral=True)
         return
     await interaction.response.defer(ephemeral=True)
-    res = await fetch_account_emails(item_id, limit=max(1, min(count, 30)))
+    acc = account.strip()
+    limit = max(1, min(count, 30))
+    item_id_for_refresh: int | None = None
+    password_for_refresh: str | None = None
+
+    if "@" in acc and ":" in acc:
+        # email:pass  (password may itself contain ':' → split on the first colon only)
+        address, _, password = acc.partition(":")
+        address, password = address.strip(), password.strip()
+        password_for_refresh = password
+        res = await read_inbox(address, password, limit=limit)
+    else:
+        # treat as an account item ID
+        res = await fetch_account_emails(acc, limit=limit)
+        item_id_for_refresh = int(re.sub(r"[^0-9]", "", acc) or 0) or None
+
     if not res["ok"]:
         await interaction.followup.send(f"⚠️ Couldn't read the inbox: `{res['error']}`", ephemeral=True)
         return
-    iid = int(re.sub(r"[^0-9]", "", str(item_id)) or 0)
-    pager = EmailPager(res["address"], res["messages"], iid)
+    pager = EmailPager(res["address"], res["messages"], item_id_for_refresh, password_for_refresh)
     await interaction.followup.send(embed=pager.render(), view=pager, ephemeral=True)
 
 
@@ -4383,6 +4412,9 @@ def _build_ai_shop_prompt() -> str:
         "'Axe of Champions' (matches every FNCS axe: I, II, III…); 'minty'/'mint axe' → "
         "'Merry Mint Axe'; 'renegade' → 'Renegade Raider'; 'AAT' → 'Aerial Assault Trooper'; "
         "'gaia' → 'Gaia's Vengeance'. Always put the official name in skins, not the nickname.\n"
+        "- If a customer names a skin/pickaxe you do NOT clearly recognise or aren't confident of "
+        "the official name for, DON'T guess and DON'T search — instead ask them for the EXACT "
+        "in-game name (action \"none\"). Only search once you know the real cosmetic name.\n"
         "- If they mention a REGION (EU, NA, AP, KR, BR, LATAM, TR), put it in the region field.\n"
         "- When they ask for a SPECIFIC item/region, the system shows the CHEAPEST match for their "
         "budget — so never show an expensive account when a cheaper one fits.\n"
