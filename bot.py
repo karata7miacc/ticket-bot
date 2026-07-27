@@ -1460,11 +1460,13 @@ def _fetch_emails_sync(host: str, address: str, password: str, limit: int) -> di
             msg = message_from_bytes(md[0][1])
             body = _email_body_text(msg)
             subject = _decode_mime_header(msg.get("Subject"))
+            clean_body = re.sub(r"\n{3,}", "\n\n", body).strip()
             messages.append({
                 "from": _decode_mime_header(msg.get("From"))[:80],
-                "subject": subject[:120] or "(no subject)",
+                "subject": subject[:140] or "(no subject)",
                 "date": (msg.get("Date") or "")[:40],
-                "snippet": re.sub(r"\s+", " ", body).strip()[:400],
+                "snippet": re.sub(r"\s+", " ", body).strip()[:300],
+                "body": clean_body[:3500],
                 "code": _find_verification_code(body) or _find_verification_code(subject),
             })
         return {"ok": True, "messages": messages}
@@ -1475,7 +1477,7 @@ def _fetch_emails_sync(host: str, address: str, password: str, limit: int) -> di
             pass
 
 
-async def fetch_account_emails(item_id: str | int, limit: int = 5) -> dict:
+async def fetch_account_emails(item_id: str | int, limit: int = 25) -> dict:
     """Read the newest inbox letters for an owned account. Returns
     {ok, address, messages, error}."""
     out = {"ok": False, "address": None, "messages": [], "error": None}
@@ -1497,31 +1499,146 @@ async def fetch_account_emails(item_id: str | int, limit: int = 5) -> dict:
     host = _imap_host_for(address)
     try:
         res = await asyncio.wait_for(
-            asyncio.to_thread(_fetch_emails_sync, host, address, password, max(1, min(limit, 10))),
-            timeout=35)
+            asyncio.to_thread(_fetch_emails_sync, host, address, password, max(1, min(limit, 30))),
+            timeout=40)
         out.update(ok=res["ok"], messages=res.get("messages", []))
     except Exception as e:
         out["error"] = f"couldn't reach the inbox ({host}): {type(e).__name__}"
     return out
 
 
-def email_letters_embed(address: str, messages: list[dict]) -> discord.Embed:
-    e = discord.Embed(title="📧  Email Letters",
-                      description=f"Inbox: `{address}`", color=AF_BLUE)
-    if not messages:
-        e.description += "\n\nNo letters found in the inbox right now."
-    for m in messages[:5]:
-        val = ""
-        if m.get("code"):
-            val += f"**Code:** `{m['code']}`\n"
-        if m.get("date"):
-            val += f"*{m['date']}*\n"
-        if m.get("snippet"):
-            val += m["snippet"][:280]
-        name = f"✉️ {m.get('subject','(no subject)')} — {m.get('from','')}"[:256]
-        e.add_field(name=name, value=(val[:1024] or "—"), inline=False)
-    e.set_footer(text="AF SERVICES • Email letters")
+# Email domain → (provider name, webmail URL) for the "how to get codes" guide.
+EMAIL_PROVIDERS = {
+    "rambler.ru": ("Rambler", "https://mail.rambler.ru"),
+    "myrambler.ru": ("Rambler", "https://mail.rambler.ru"),
+    "autorambler.ru": ("Rambler", "https://mail.rambler.ru"),
+    "ro.ru": ("Rambler", "https://mail.rambler.ru"),
+    "lenta.ru": ("Rambler", "https://mail.rambler.ru"),
+    "mail.ru": ("Mail.ru", "https://e.mail.ru"),
+    "bk.ru": ("Mail.ru", "https://e.mail.ru"),
+    "inbox.ru": ("Mail.ru", "https://e.mail.ru"),
+    "list.ru": ("Mail.ru", "https://e.mail.ru"),
+    "internet.ru": ("Mail.ru", "https://e.mail.ru"),
+    "gmx.com": ("GMX", "https://www.gmx.com"),
+    "gmx.net": ("GMX", "https://www.gmx.net"),
+    "gmx.de": ("GMX", "https://www.gmx.net"),
+    "outlook.com": ("Outlook", "https://outlook.live.com"),
+    "hotmail.com": ("Outlook", "https://outlook.live.com"),
+    "live.com": ("Outlook", "https://outlook.live.com"),
+    "gmail.com": ("Gmail", "https://mail.google.com"),
+    "firstmail.ltd": ("Firstmail", "https://firstmail.ltd"),
+    "firstmail.com": ("Firstmail", "https://firstmail.ltd"),
+    "yahoo.com": ("Yahoo", "https://mail.yahoo.com"),
+}
+
+
+def _email_provider(address: str) -> tuple[str, str | None]:
+    domain = (address or "").split("@")[-1].strip().lower()
+    if domain in EMAIL_PROVIDERS:
+        return EMAIL_PROVIDERS[domain]
+    return (domain or "Email", None)
+
+
+def email_provider_guide_embed(address: str) -> discord.Embed:
+    name, url = _email_provider(address)
+    body = (
+        f"Your account's email is a **{name}** inbox (`{address}`).\n\n"
+        "**To get login / verification codes:**\n"
+        "1️⃣ Tap **📧 Read email letters** on your delivery above — it shows **all** letters in "
+        "the inbox and pulls out the code automatically. No external site needed.\n"
+    )
+    if url:
+        body += (f"2️⃣ Or log in directly at **{url}** using the email & password from your "
+                 "delivery.\n")
+    body += "\n💡 Codes arrive as new letters — hit the button again to refresh."
+    e = discord.Embed(title="📧  How to get your email codes", description=body, color=AF_BLUE)
+    e.set_footer(text="AF SERVICES • Email access")
     return e
+
+
+class EmailPager(discord.ui.View):
+    """LZT-style inbox reader: paginated list of ALL letters + open any one in full."""
+    PAGE = 8
+
+    def __init__(self, address: str, messages: list[dict], item_id: int | None = None):
+        super().__init__(timeout=600)
+        self.address = address
+        self.messages = messages[:30]
+        self.item_id = item_id
+        self.page = 0
+
+        self.prev_btn = discord.ui.Button(label="◀ Prev", style=discord.ButtonStyle.secondary)
+        self.prev_btn.callback = self._prev
+        self.next_btn = discord.ui.Button(label="Next ▶", style=discord.ButtonStyle.secondary)
+        self.next_btn.callback = self._next
+        self.refresh_btn = discord.ui.Button(label="🔄 Refresh", style=discord.ButtonStyle.primary)
+        self.refresh_btn.callback = self._refresh_btn
+        self.add_item(self.prev_btn)
+        self.add_item(self.next_btn)
+        self.add_item(self.refresh_btn)
+
+        if self.messages:
+            opts = [discord.SelectOption(
+                label=f"{i + 1}. {(m.get('subject') or '(no subject)')[:80]}",
+                description=(m.get("from") or "")[:90],
+                value=str(i)) for i, m in enumerate(self.messages[:25])]
+            self.selector = discord.ui.Select(placeholder="Open a letter to read it in full…",
+                                              options=opts)
+            self.selector.callback = self._open
+            self.add_item(self.selector)
+
+    def _pages(self) -> int:
+        return max(1, (len(self.messages) + self.PAGE - 1) // self.PAGE)
+
+    def render(self) -> discord.Embed:
+        pages = self._pages()
+        self.page = max(0, min(self.page, pages - 1))
+        start = self.page * self.PAGE
+        chunk = self.messages[start:start + self.PAGE]
+        e = discord.Embed(title="📧  Email Letters", color=AF_BLUE,
+                          description=f"Inbox: `{self.address}` • **{len(self.messages)}** letter(s)")
+        if not self.messages:
+            e.description += "\n\nNo letters in the inbox right now — tap 🔄 Refresh after "
+            e.description += "requesting a code."
+        for i, m in enumerate(chunk):
+            code = f" • code `{m['code']}`" if m.get("code") else ""
+            name = f"{start + i + 1}. ✉️ {m.get('subject', '(no subject)')}"[:256]
+            val = f"{(m.get('from') or '')[:70]} • *{m.get('date', '')}*{code}\n{m.get('snippet', '')[:150]}"
+            e.add_field(name=name, value=val[:1024] or "—", inline=False)
+        self.prev_btn.disabled = self.next_btn.disabled = (pages <= 1)
+        e.set_footer(text=f"Page {self.page + 1}/{pages} • pick a letter below to read it fully")
+        return e
+
+    async def _prev(self, interaction: discord.Interaction):
+        self.page = (self.page - 1) % self._pages()
+        await interaction.response.edit_message(embed=self.render(), view=self)
+
+    async def _next(self, interaction: discord.Interaction):
+        self.page = (self.page + 1) % self._pages()
+        await interaction.response.edit_message(embed=self.render(), view=self)
+
+    async def _refresh_btn(self, interaction: discord.Interaction):
+        await interaction.response.defer()
+        newview = self
+        if self.item_id:
+            res = await fetch_account_emails(self.item_id)
+            if res["ok"]:
+                newview = EmailPager(res["address"] or self.address, res["messages"], self.item_id)
+        await interaction.edit_original_response(embed=newview.render(), view=newview)
+
+    async def _open(self, interaction: discord.Interaction):
+        idx = int(self.selector.values[0])
+        m = self.messages[idx]
+        body = m.get("body") or m.get("snippet") or "(empty letter)"
+        e = discord.Embed(title=f"✉️  {m.get('subject', '(no subject)')}"[:256],
+                          description=body[:4000], color=AF_BLUE)
+        e.add_field(name="From", value=(m.get("from") or "—")[:200], inline=True)
+        if m.get("date"):
+            e.add_field(name="Date", value=m["date"], inline=True)
+        if m.get("code"):
+            e.add_field(name="Code", value=f"`{m['code']}`", inline=True)
+        e.set_footer(text="AF SERVICES • Email letter")
+        await interaction.response.send_message(embed=e, ephemeral=True)
 
 
 class ReadMailButton(discord.ui.DynamicItem[discord.ui.Button],
@@ -1545,8 +1662,8 @@ class ReadMailButton(discord.ui.DynamicItem[discord.ui.Button],
                 f"⚠️ Couldn't read the email letters: `{res['error']}`\n"
                 "You can still log in with the email:pass provided above.", ephemeral=True)
             return
-        await interaction.followup.send(
-            embed=email_letters_embed(res["address"], res["messages"]), ephemeral=True)
+        pager = EmailPager(res["address"], res["messages"], self.item_id)
+        await interaction.followup.send(embed=pager.render(), view=pager, ephemeral=True)
 
 
 # ============================================================
@@ -1661,6 +1778,14 @@ async def deliver_account(
     if mail_view is not None:
         send_kwargs["view"] = mail_view
     await channel.send(**send_kwargs)
+    # Tell the buyer how to read codes for this specific email provider.
+    if EMAIL_LETTERS_ENABLED and has_email:
+        addr = creds.get("email_login") or (str(creds.get("email_raw") or "").split(":")[0])
+        if addr:
+            try:
+                await channel.send(embed=email_provider_guide_embed(addr))
+            except Exception as e:
+                print("Email guide post failed:", e)
     try:
         await owner.send(embed=embed)  # also DM the buyer as a backup copy
     except Exception:
@@ -3018,12 +3143,13 @@ async def email_command(interaction: discord.Interaction, item_id: str, count: i
         await interaction.response.send_message("Email reading is disabled.", ephemeral=True)
         return
     await interaction.response.defer(ephemeral=True)
-    res = await fetch_account_emails(item_id, limit=count)
+    res = await fetch_account_emails(item_id, limit=max(1, min(count, 30)))
     if not res["ok"]:
         await interaction.followup.send(f"⚠️ Couldn't read the inbox: `{res['error']}`", ephemeral=True)
         return
-    await interaction.followup.send(
-        embed=email_letters_embed(res["address"], res["messages"]), ephemeral=True)
+    iid = int(re.sub(r"[^0-9]", "", str(item_id)) or 0)
+    pager = EmailPager(res["address"], res["messages"], iid)
+    await interaction.followup.send(embed=pager.render(), view=pager, ephemeral=True)
 
 
 # ============================================================
