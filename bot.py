@@ -190,6 +190,26 @@ RESALE_MULTIPLIER = float(os.getenv("RESALE_MULTIPLIER", "2.5") or "2.5")
 # Where "buy this now to restock" alerts go. If unset, the alert DMs the staff who triggered it.
 RESTOCK_CHANNEL_ID = int(os.getenv("RESTOCK_CHANNEL_ID", "0") or "0")
 
+# --- Email (inbox) letter reading: fetch verification letters via IMAP using the
+# account's email:pass, so we never need to hand out an LZT email link. ---
+EMAIL_LETTERS_ENABLED = os.getenv("EMAIL_LETTERS_ENABLED", "1").lower() not in ("0", "false", "no", "")
+# Fallback IMAP host when the email domain isn't in the map below (else imap.<domain>).
+IMAP_HOST_DEFAULT = os.getenv("IMAP_HOST_DEFAULT", "")
+# Known email-domain → IMAP host (the providers commonly attached to shop accounts).
+IMAP_HOSTS = {
+    "rambler.ru": "imap.rambler.ru", "myrambler.ru": "imap.rambler.ru",
+    "autorambler.ru": "imap.rambler.ru", "ro.ru": "imap.rambler.ru", "lenta.ru": "imap.rambler.ru",
+    "mail.ru": "imap.mail.ru", "internet.ru": "imap.mail.ru", "bk.ru": "imap.mail.ru",
+    "inbox.ru": "imap.mail.ru", "list.ru": "imap.mail.ru",
+    "gmx.com": "imap.gmx.com", "gmx.net": "imap.gmx.net", "gmx.de": "imap.gmx.net", "gmx.us": "imap.gmx.com",
+    "outlook.com": "outlook.office365.com", "hotmail.com": "outlook.office365.com",
+    "live.com": "outlook.office365.com",
+    "gmail.com": "imap.gmail.com", "googlemail.com": "imap.gmail.com",
+    "firstmail.ltd": "imap.firstmail.ltd", "firstmail.com": "imap.firstmail.ltd",
+    "fmailler.com": "imap.firstmail.ltd", "dfirstmail.com": "imap.firstmail.ltd",
+    "yahoo.com": "imap.mail.yahoo.com",
+}
+
 # --- NowPayments (crypto checkout for custom orders) ---
 NOWPAYMENTS_API_KEY = os.getenv("NOWPAYMENTS_API_KEY", "")
 NOWPAYMENTS_API_BASE = os.getenv("NOWPAYMENTS_API_BASE", "https://api.nowpayments.io/v1").rstrip("/")
@@ -1371,6 +1391,165 @@ async def lzt_get_credentials(item_id: str | int) -> dict:
 
 
 # ============================================================
+# EMAIL LETTERS — read the account inbox over IMAP (email:pass)
+# ============================================================
+def _imap_host_for(address: str) -> str:
+    domain = address.split("@")[-1].strip().lower()
+    return IMAP_HOSTS.get(domain) or IMAP_HOST_DEFAULT or f"imap.{domain}"
+
+
+def _decode_mime_header(value: str | None) -> str:
+    if not value:
+        return ""
+    from email.header import decode_header
+    out = ""
+    for txt, enc in decode_header(value):
+        if isinstance(txt, bytes):
+            try:
+                out += txt.decode(enc or "utf-8", "replace")
+            except Exception:
+                out += txt.decode("utf-8", "replace")
+        else:
+            out += txt
+    return out
+
+
+def _email_body_text(msg) -> str:
+    """Plain-text body of an email.Message (HTML stripped as a fallback)."""
+    def _decode(part):
+        payload = part.get_payload(decode=True)
+        if not payload:
+            return ""
+        return payload.decode(part.get_content_charset() or "utf-8", "replace")
+
+    if msg.is_multipart():
+        for part in msg.walk():
+            if part.get_content_type() == "text/plain":
+                return _decode(part)
+        for part in msg.walk():
+            if part.get_content_type() == "text/html":
+                return re.sub(r"<[^>]+>", " ", _decode(part))
+        return ""
+    body = _decode(msg)
+    if msg.get_content_type() == "text/html":
+        body = re.sub(r"<[^>]+>", " ", body)
+    return body
+
+
+def _find_verification_code(text: str) -> str | None:
+    m = re.search(r"\b(\d{4,8})\b", text or "")
+    return m.group(1) if m else None
+
+
+def _fetch_emails_sync(host: str, address: str, password: str, limit: int) -> dict:
+    """Blocking IMAP fetch of the newest `limit` inbox messages. Run via to_thread."""
+    import imaplib
+    from email import message_from_bytes
+    M = imaplib.IMAP4_SSL(host, 993, timeout=25)
+    try:
+        M.login(address, password)
+        M.select("INBOX")
+        typ, data = M.search(None, "ALL")
+        ids = data[0].split() if data and data[0] else []
+        ids = ids[-limit:]
+        messages = []
+        for i in reversed(ids):
+            typ, md = M.fetch(i, "(RFC822)")
+            if not md or not md[0]:
+                continue
+            msg = message_from_bytes(md[0][1])
+            body = _email_body_text(msg)
+            subject = _decode_mime_header(msg.get("Subject"))
+            messages.append({
+                "from": _decode_mime_header(msg.get("From"))[:80],
+                "subject": subject[:120] or "(no subject)",
+                "date": (msg.get("Date") or "")[:40],
+                "snippet": re.sub(r"\s+", " ", body).strip()[:400],
+                "code": _find_verification_code(body) or _find_verification_code(subject),
+            })
+        return {"ok": True, "messages": messages}
+    finally:
+        try:
+            M.logout()
+        except Exception:
+            pass
+
+
+async def fetch_account_emails(item_id: str | int, limit: int = 5) -> dict:
+    """Read the newest inbox letters for an owned account. Returns
+    {ok, address, messages, error}."""
+    out = {"ok": False, "address": None, "messages": [], "error": None}
+    if not EMAIL_LETTERS_ENABLED:
+        out["error"] = "email reading is disabled"
+        return out
+    creds = await lzt_get_credentials(item_id)
+    if not creds["ok"]:
+        out["error"] = creds["error"]
+        return out
+    address = creds.get("email_login")
+    password = creds.get("email_password")
+    if not (address and password) and creds.get("email_raw") and ":" in str(creds["email_raw"]):
+        address, _, password = str(creds["email_raw"]).partition(":")
+    if not (address and password):
+        out["error"] = "this account has no email (inbox) access"
+        return out
+    out["address"] = address
+    host = _imap_host_for(address)
+    try:
+        res = await asyncio.wait_for(
+            asyncio.to_thread(_fetch_emails_sync, host, address, password, max(1, min(limit, 10))),
+            timeout=35)
+        out.update(ok=res["ok"], messages=res.get("messages", []))
+    except Exception as e:
+        out["error"] = f"couldn't reach the inbox ({host}): {type(e).__name__}"
+    return out
+
+
+def email_letters_embed(address: str, messages: list[dict]) -> discord.Embed:
+    e = discord.Embed(title="📧  Email Letters",
+                      description=f"Inbox: `{address}`", color=AF_BLUE)
+    if not messages:
+        e.description += "\n\nNo letters found in the inbox right now."
+    for m in messages[:5]:
+        val = ""
+        if m.get("code"):
+            val += f"**Code:** `{m['code']}`\n"
+        if m.get("date"):
+            val += f"*{m['date']}*\n"
+        if m.get("snippet"):
+            val += m["snippet"][:280]
+        name = f"✉️ {m.get('subject','(no subject)')} — {m.get('from','')}"[:256]
+        e.add_field(name=name, value=(val[:1024] or "—"), inline=False)
+    e.set_footer(text="AF SERVICES • Email letters")
+    return e
+
+
+class ReadMailButton(discord.ui.DynamicItem[discord.ui.Button],
+                     template=r"af_mail:(?P<item_id>\d+)"):
+    """Persistent button on a delivery message → reads the account's inbox letters."""
+    def __init__(self, item_id: int):
+        self.item_id = int(item_id)
+        super().__init__(discord.ui.Button(
+            label="📧 Read email letters", style=discord.ButtonStyle.secondary,
+            custom_id=f"af_mail:{item_id}"))
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        return cls(int(match["item_id"]))
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        res = await fetch_account_emails(self.item_id)
+        if not res["ok"]:
+            await interaction.followup.send(
+                f"⚠️ Couldn't read the email letters: `{res['error']}`\n"
+                "You can still log in with the email:pass provided above.", ephemeral=True)
+            return
+        await interaction.followup.send(
+            embed=email_letters_embed(res["address"], res["messages"]), ephemeral=True)
+
+
+# ============================================================
 # DELIVERY — idempotent account release into a ticket
 # ============================================================
 async def order_already_delivered(order_id: str | None) -> bool:
@@ -1470,7 +1649,18 @@ async def deliver_account(
                               creds["login"], creds["password"], creds["raw"],
                               creds.get("email_login"), creds.get("email_password"),
                               creds.get("email_raw"))
-    await channel.send(content=owner.mention, embed=embed, files=embed_files())
+    # If the account ships with email access, offer a "Read email letters" button
+    # so the buyer can pull verification codes without any external link.
+    mail_view = None
+    has_email = bool(creds.get("email_login") or creds.get("email_raw"))
+    iid_int = int(re.sub(r"[^0-9]", "", str(lzt_item_id)) or 0)
+    if EMAIL_LETTERS_ENABLED and has_email and iid_int:
+        mail_view = discord.ui.View(timeout=None)
+        mail_view.add_item(ReadMailButton(iid_int))
+    send_kwargs = {"content": owner.mention, "embed": embed, "files": embed_files()}
+    if mail_view is not None:
+        send_kwargs["view"] = mail_view
+    await channel.send(**send_kwargs)
     try:
         await owner.send(embed=embed)  # also DM the buyer as a backup copy
     except Exception:
@@ -2817,6 +3007,23 @@ async def restock_command(interaction: discord.Interaction, item_id: str):
     ticket = interaction.channel if isinstance(interaction.channel, discord.TextChannel) else None
     status = await notify_restock(interaction.user, interaction.guild, det["item"] or {}, ticket)
     await interaction.followup.send(f"✅ {status}", ephemeral=True)
+
+
+@bot.tree.command(name="email",
+                  description="Read an account's latest email letters / verification codes (staff).")
+@staff_only()
+@app_commands.describe(item_id="The account item ID (see /stock)", count="How many letters (1-10)")
+async def email_command(interaction: discord.Interaction, item_id: str, count: int = 5):
+    if not EMAIL_LETTERS_ENABLED:
+        await interaction.response.send_message("Email reading is disabled.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    res = await fetch_account_emails(item_id, limit=count)
+    if not res["ok"]:
+        await interaction.followup.send(f"⚠️ Couldn't read the inbox: `{res['error']}`", ephemeral=True)
+        return
+    await interaction.followup.send(
+        embed=email_letters_embed(res["address"], res["messages"]), ephemeral=True)
 
 
 # ============================================================
@@ -4943,9 +5150,9 @@ async def on_ready():
     bot.add_view(DeliveryApprovalView())
     bot.add_view(CryptoPayView())
     bot.add_view(CryptoCheckView())
-    # Resolve "View all skins" buttons on account embeds after restarts.
+    # Resolve dynamic buttons (View all skins / Read email letters) after restarts.
     try:
-        bot.add_dynamic_items(ViewSkinsButton)
+        bot.add_dynamic_items(ViewSkinsButton, ReadMailButton)
     except Exception as e:
         print("Dynamic item register failed:", e)
 
