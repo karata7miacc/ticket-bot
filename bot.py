@@ -65,6 +65,17 @@ COMPENSATION_ROLE_ID = int(os.getenv("COMPENSATION_ROLE_ID", "0") or "0")
 # Warranty text shown on delivery and in replacement tickets.
 WARRANTY_TEXT = os.getenv("WARRANTY_TEXT", "24-hour warranty & replacement support")
 
+# Replacement / warranty policy (from the shop's Terms of Service). Shown to the
+# customer and used by the replacement assistant to judge eligibility.
+REPLACEMENT_RULES = (
+    "• Replacements are **ONLY** for **invalid** or **banned** accounts.\n"
+    "• **No refunds.**\n"
+    "• **No review = no warranty** — if you didn't leave a review, your warranty is void.\n"
+    "• **Full-Access accounts:** a **recording is REQUIRED** (before receiving, logging in, "
+    "securing, recovery ticket, first match). No recording = no replacement.\n"
+    "• False info / false reviews may be refused and can result in a timeout."
+)
+
 STATUS_ROTATE_SECONDS = int(os.getenv("STATUS_ROTATE_SECONDS", "15") or "15")
 DELETE_COUNTDOWN_SECONDS = int(os.getenv("DELETE_COUNTDOWN_SECONDS", "5") or "5")
 
@@ -593,7 +604,8 @@ def _spent_metric(category: str, item: dict) -> int:
 
 
 async def lzt_search_market(category: str, budget: float | None = None,
-                            count: int = 3, pool: int | None = None) -> dict:
+                            count: int = 3, pool: int | None = None,
+                            cheapest: bool = False) -> dict:
     """Search live LZT.market listings we can buy & resell within a budget, ranked
     by how much the previous owner spent (VP for Valorant, V-Bucks for Fortnite) so
     the customer gets the richest account their budget allows.
@@ -606,7 +618,9 @@ async def lzt_search_market(category: str, budget: float | None = None,
     if not slug:
         out["error"] = f"unknown category '{category}'"
         return out
-    params: dict = {"order_by": "price_to_down"}  # pull the pricier (richer) listings first
+    # For a specific request (a named skin/game) pull cheapest-first so the customer
+    # gets the cheapest account that matches; otherwise pull the richest first.
+    params: dict = {"order_by": "price_to_up" if cheapest else "price_to_down"}
     if budget and budget > 0:
         params["pmax"] = round(budget / RESALE_MULTIPLIER, 2)
     res = await _lzt_get(f"/{slug}", params)
@@ -614,9 +628,12 @@ async def lzt_search_market(category: str, budget: float | None = None,
         out["error"] = res["error"]
         return out
     items = (res["data"] or {}).get("items") or []
-    # Rank strictly by amount spent (highest VP / V-Bucks spent first), so within
-    # the budget we always surface the accounts with the most invested in them.
-    items.sort(key=lambda it: _spent_metric(category, it), reverse=True)
+    if cheapest:
+        # Cheapest matching account first (within budget).
+        items.sort(key=lambda it: float(it.get("price") or 1e9))
+    else:
+        # Richest first — most invested in the account for the budget.
+        items.sort(key=lambda it: _spent_metric(category, it), reverse=True)
     limit = pool if pool else max(1, min(count, 5))
     out.update(ok=True, items=items[:max(1, limit)])
     return out
@@ -827,6 +844,16 @@ _COSMETIC_ALIASES: list[tuple[list[str], list[str]]] = [
     (["star wand", "star wand pickaxe"], ["star wand"]),
     (["candy axe"], ["candy axe"]),
     (["reaper pickaxe", "harvesting tool"], ["reaper"]),
+    (["gaia", "gaia vengeance", "gaias vengeance", "gaia's vengeance"], ["gaia"]),
+    # Steam-game shorthands → substrings of the official titles.
+    (["gta", "gta v", "gta 5", "grand theft"], ["grand theft auto"]),
+    (["cs2", "cs go", "csgo", "counter strike", "counter-strike"], ["counter-strike"]),
+    (["rdr2", "rdr", "red dead"], ["red dead redemption"]),
+    (["cod", "call of duty", "modern warfare", "warzone"], ["call of duty"]),
+    (["pubg"], ["pubg", "playerunknown"]),
+    (["apex"], ["apex legends"]),
+    (["r6", "rainbow six", "siege"], ["rainbow six"]),
+    (["rocket league", "rl"], ["rocket league"]),
 ]
 
 
@@ -854,6 +881,65 @@ def _cosmetic_matches(owned_lower: list[str], term: str) -> bool:
         if any(cand in n for n in owned_lower):
             return True
     return False
+
+
+def _steam_game_names(item: dict) -> list[str]:
+    """Best-effort list of the game titles on a Steam account listing."""
+    names: list[str] = []
+    for key in ("steam_full_games", "steamGames", "steam_games", "games"):
+        v = item.get(key)
+        entries = None
+        if isinstance(v, dict):
+            sub = v.get("list")
+            entries = sub if isinstance(sub, (list, dict)) else v
+        elif isinstance(v, list):
+            entries = v
+        if entries:
+            it = entries.values() if isinstance(entries, dict) else entries
+            for g in it:
+                if isinstance(g, dict):
+                    n = g.get("title") or g.get("name") or g.get("appName")
+                    if n:
+                        names.append(str(n))
+                elif isinstance(g, str) and g.strip():
+                    names.append(g.strip())
+            if names:
+                return names
+    return names
+
+
+async def _searchable_names(game: str, item: dict) -> list[str]:
+    """Names to match a customer's request against, per game:
+    Valorant/Fortnite → cosmetics; Steam → game titles; anything else → the title."""
+    g = (game or "").lower()
+    if g in ("valorant", "fortnite"):
+        sections = await build_cosmetic_sections(g, item)
+        return [n for names in sections.values() for n in names]
+    if g in ("steam",):
+        names = _steam_game_names(item)
+        if names:
+            return names
+    title = item.get("title") or item.get("title_en") or ""
+    return [str(title)] if title else []
+
+
+_REGION_ALIASES = {
+    "eu": ["eu", "europe"], "na": ["na", "north america"], "ap": ["ap", "asia"],
+    "kr": ["kr", "korea"], "br": ["br", "brazil"], "latam": ["latam", "latin"],
+    "tr": ["tr", "turkey"], "mena": ["mena", "middle east"],
+}
+
+
+def _region_matches(item: dict, region: str | None) -> bool:
+    """True if a Valorant/Riot listing is in the requested region (best effort)."""
+    if not region:
+        return True
+    hay = " ".join(str(item.get(k) or "") for k in
+                   ("valorantRegionPhrase", "riot_valorant_region", "region")).lower()
+    if not hay.strip():
+        return True  # region unknown on the listing → don't exclude it
+    keys = _REGION_ALIASES.get(region.lower(), [region.lower()])
+    return any(k in hay for k in keys)
 
 
 _GENERIC_STAT_FIELDS = [
@@ -1630,10 +1716,13 @@ def make_proof_checklist_embed(kind: str) -> discord.Embed:
                     value="Your original **order ID** or purchase proof.", inline=False)
         e.add_field(name="2️⃣ The issue",
                     value="Describe the problem clearly (what happened, when).", inline=False)
-        e.add_field(name="3️⃣ Requirements followed",
-                    value="Proof you followed the account's **description / warranty "
-                          "requirements** (e.g. didn't change the email, secured it as instructed).",
-                    inline=False)
+        e.add_field(name="3️⃣ Recording (Full-Access accounts)",
+                    value="A **video** is REQUIRED — record **before receiving** the account, "
+                          "**logging in**, **securing it** (email/password/2FA), making the "
+                          "**recovery ticket**, and **entering your first match**. "
+                          "**No recording = no replacement.**", inline=False)
+        e.add_field(name="⚠️ Replacement policy",
+                    value=REPLACEMENT_RULES, inline=False)
     e.set_author(name="AF SERVICES • Verification")
     e.set_thumbnail(url=logo_ref())
     e.set_footer(text="Staff will review your proof, then forward this ticket to the owner.")
@@ -1652,7 +1741,8 @@ async def forward_ticket_flow(
     `forwarded_by` is the staff member who forwarded, or None when the AI assistant
     forwards automatically. Returns (ok, ephemeral_status_message)."""
     row = await db_fetchrow(
-        "SELECT owner_id, kind, status, forwarded_to_owner FROM tickets WHERE channel_id=$1",
+        "SELECT owner_id, kind, status, forwarded_to_owner, reserved_market_item_id "
+        "FROM tickets WHERE channel_id=$1",
         channel.id,
     )
     if not row:
@@ -1721,6 +1811,15 @@ async def forward_ticket_flow(
         ),
         color=0x9B59B6,
     )
+    # If the customer picked a specific account, tell the owner exactly which
+    # listing to buy/deliver (id + direct link).
+    reserved = row["reserved_market_item_id"]
+    if reserved:
+        e.add_field(
+            name="🆔 Account to buy / deliver",
+            value=f"`{reserved}` — [open listing]({LZT_SITE}/{reserved}/)\n"
+                  f"Buy this after payment is confirmed, then `/deliver {reserved}`.",
+            inline=False)
     e.set_thumbnail(url=logo_ref())
     e.set_footer(text="AF SERVICES • Owner hand-off")
     await channel.send(content=ping, embed=e)
@@ -2564,18 +2663,23 @@ MARKET_MAX_SCAN = 20  # cap on detail lookups when filtering by skin
     category="Game the customer wants",
     budget="Customer's max budget in EUR (optional — we find accounts that fit)",
     count="How many accounts to show (1-5, default 3)",
-    skins="Optional: require specific skin(s). Comma-separated for more than one (e.g. reaver, prime).",
+    skins="Require specific skin(s)/game(s). Comma-separated (e.g. reaver, prime / GTA V, CS2).",
+    region="Optional region filter (e.g. EU, NA, AP) — Valorant/Riot.",
 )
 @app_commands.choices(category=MARKET_CATEGORY_CHOICES)
 async def market_command(interaction: discord.Interaction, category: app_commands.Choice[str],
-                         budget: float | None = None, count: int = 3, skins: str | None = None):
+                         budget: float | None = None, count: int = 3,
+                         skins: str | None = None, region: str | None = None):
     await interaction.response.defer()
     count = max(1, min(count, 5))
     wanted = [s.strip() for s in re.split(r"[,\n]+", skins) if s.strip()] if skins else []
+    region = (region or "").strip().lower() or None
 
-    # When filtering by skin we scan a bigger ranked pool and keep the matches.
-    pool = MARKET_MAX_SCAN if wanted else count
-    res = await lzt_search_market(category.value, budget=budget, count=count, pool=pool)
+    # When filtering we scan a bigger pool; a specific request pulls cheapest-first.
+    specific = bool(wanted or region)
+    pool = MARKET_MAX_SCAN if specific else count
+    res = await lzt_search_market(category.value, budget=budget, count=count, pool=pool,
+                                  cheapest=specific)
     if not res["ok"]:
         await interaction.followup.send(f"⚠️ Stock error: `{res['error']}`", ephemeral=True)
         return
@@ -2595,10 +2699,10 @@ async def market_command(interaction: discord.Interaction, category: app_command
         det = await lzt_item_detail(it.get("item_id") or it.get("id"))
         scanned += 1
         item = det["item"] if det["ok"] else it
-        # Skin filtering only applies to games with cosmetic lists (Valorant/Fortnite).
-        if wanted and category.value in ("valorant", "fortnite"):
-            sections = await build_cosmetic_sections(category.value, item)
-            owned = [n.lower() for names in sections.values() for n in names]
+        if region and not _region_matches(item, region):
+            continue
+        if wanted:
+            owned = [n.lower() for n in await _searchable_names(category.value, item)]
             if not all(_cosmetic_matches(owned, w) for w in wanted):
                 continue
         chosen.append(item)
@@ -2606,8 +2710,10 @@ async def market_command(interaction: discord.Interaction, category: app_command
     cosmetic_game = category.value in ("valorant", "fortnite")
     if not chosen:
         msg = f"No {category.name} accounts matched"
-        if wanted and cosmetic_game:
-            msg += f" the skin(s): **{', '.join(wanted)}**"
+        if wanted:
+            msg += f" **{', '.join(wanted)}**"
+        if region:
+            msg += f" in region **{region.upper()}**"
         if budget:
             msg += f" under €{budget:.0f}"
         await interaction.followup.send(msg + ".", ephemeral=True)
@@ -2620,14 +2726,18 @@ async def market_command(interaction: discord.Interaction, category: app_command
         if file:
             files.append(file)
 
-    if category.value == "valorant":
+    if specific:
+        header = f"🛍️ **{category.name} accounts** — cheapest match first"
+    elif category.value == "valorant":
         header = f"🛍️ **{category.name} accounts available** — highest **VP spent** first"
     elif category.value == "fortnite":
         header = f"🛍️ **{category.name} accounts available** — highest **V-Bucks spent** first"
     else:
         header = f"🛍️ **{category.name} accounts available** — best value first"
-    if wanted and cosmetic_game:
+    if wanted:
         header += f" · matching **{', '.join(wanted)}**"
+    if region:
+        header += f" · region **{region.upper()}**"
     if budget:
         header += f" · within a **€{budget:.0f}** budget"
 
@@ -3817,11 +3927,13 @@ async def post_card_checkout(channel: discord.TextChannel, account_price: float)
 
 
 async def present_accounts(channel: discord.TextChannel, game: str, budget: float | None,
-                           wanted: list[str], count: int = 3) -> int:
+                           wanted: list[str], count: int = 3, region: str | None = None) -> int:
     """Search, filter, and post matching accounts; remember them for selection.
-    Returns how many were shown."""
-    pool = 20 if wanted else count
-    res = await lzt_search_market(game, budget=budget, count=count, pool=pool)
+    A specific request (named item/region) is shown cheapest-first. Returns count shown."""
+    region = (region or "").strip().lower() or None
+    specific = bool(wanted or region)
+    pool = 20 if specific else count
+    res = await lzt_search_market(game, budget=budget, count=count, pool=pool, cheapest=specific)
     if not res["ok"]:
         await channel.send(f"⚠️ I couldn't reach the stock right now (`{res['error']}`). "
                            f"A staff member will help you shortly.")
@@ -3834,15 +3946,20 @@ async def present_accounts(channel: discord.TextChannel, game: str, budget: floa
         det = await lzt_item_detail(it.get("item_id") or it.get("id"))
         scanned += 1
         item = det["item"] if det["ok"] else it
-        # Skin filtering only applies to games with cosmetic lists (Valorant/Fortnite).
-        if wanted and game in ("valorant", "fortnite"):
-            sections = await build_cosmetic_sections(game, item)
-            owned = [n.lower() for names in sections.values() for n in names]
+        if region and not _region_matches(item, region):
+            continue
+        if wanted:
+            owned = [n.lower() for n in await _searchable_names(game, item)]
             if not all(_cosmetic_matches(owned, w) for w in wanted):
                 continue
         chosen.append(item)
     if not chosen:
-        extra = f" matching {', '.join(wanted)}" if (wanted and game in ("valorant", "fortnite")) else ""
+        bits = []
+        if wanted:
+            bits.append("matching " + ", ".join(wanted))
+        if region:
+            bits.append(f"in {region.upper()}")
+        extra = (" " + " ".join(bits)) if bits else ""
         await channel.send(
             f"I couldn't find a {game_label(game)} account{extra} within that budget right now. "
             f"Try a higher budget, or a staff member can source one for you.")
@@ -3862,8 +3979,9 @@ async def present_accounts(channel: discord.TextChannel, game: str, budget: floa
     shop_offers[channel.id] = offers
 
     view = skins_view_for(chosen, game) if game in ("valorant", "fortnite") else None
+    lead = "Here are the cheapest matches 👇" if specific else "Here are the best matches 👇"
     kwargs = {
-        "content": "Here are the best matches 👇 Reply with the **number** of the one you want, "
+        "content": f"{lead} Reply with the **number** of the one you want, "
                    "or ask me to adjust the budget.",
         "embeds": embeds[:10], "files": files,
     }
@@ -3895,12 +4013,16 @@ def _build_ai_shop_prompt() -> str:
         "after payment. You only take the order up to payment/proof.\n"
         "- Card payments include a surcharge; the system computes the exact total — don't quote a "
         "card total yourself, just say card has a small fee and let the system post it.\n"
-        "- 'skins' only matters for valorant/fortnite; ignore it for other games.\n"
+        "- 'skins' is for the specific things they want: Valorant/Fortnite cosmetics, OR Steam "
+        "game titles (e.g. 'GTA V', 'CS2'). Put each requested item in the skins array.\n"
         "- When the customer names a cosmetic by a community NICKNAME, translate it to the "
         "OFFICIAL in-game name(s) in the skins array. Examples: 'FNCS pickaxe'/'FNCS axe' → "
         "'Axe of Champions' (matches every FNCS axe: I, II, III…); 'minty'/'mint axe' → "
-        "'Merry Mint Axe'; 'renegade' → 'Renegade Raider'; 'AAT' → 'Aerial Assault Trooper'. "
-        "Always put the official name in skins, not the nickname.\n"
+        "'Merry Mint Axe'; 'renegade' → 'Renegade Raider'; 'AAT' → 'Aerial Assault Trooper'; "
+        "'gaia' → 'Gaia's Vengeance'. Always put the official name in skins, not the nickname.\n"
+        "- If they mention a REGION (EU, NA, AP, KR, BR, LATAM, TR), put it in the region field.\n"
+        "- When they ask for a SPECIFIC item/region, the system shows the CHEAPEST match for their "
+        "budget — so never show an expensive account when a cheaper one fits.\n"
         "- Be warm, concise, human.\n\n"
         "Each turn, respond with ONLY a JSON object (no prose around it):\n"
         "{\n"
@@ -3908,7 +4030,8 @@ def _build_ai_shop_prompt() -> str:
         '  "action": "none" | "search" | "select" | "checkout",\n'
         '  "game": "<one of the KEYS above>" | null,\n'
         '  "budget": <number|null>,          // EUR, for search\n'
-        '  "skins": [<string>, ...] | null,  // valorant/fortnite only\n'
+        '  "skins": [<string>, ...] | null,  // specific cosmetics (val/fn) or Steam games\n'
+        '  "region": "<EU|NA|AP|KR|BR|LATAM|TR>" | null,\n'
         '  "index": <number|null>,           // which shown account they picked (1-based)\n'
         '  "method": "crypto" | "card" | null // for checkout\n'
         "}\n\n"
@@ -3977,8 +4100,9 @@ async def run_ai_shopping(channel: discord.TextChannel, owner: discord.abc.User)
         game = str(data.get("game") or "").lower()
         budget = _num(data.get("budget"))
         wanted = [str(s).strip() for s in (data.get("skins") or []) if str(s).strip()]
+        region = str(data.get("region") or "").strip() or None
         if game in LZT_MARKET_SLUGS and budget and budget > 0:
-            await present_accounts(channel, game, budget, wanted)
+            await present_accounts(channel, game, budget, wanted, region=region)
 
     elif action == "select":
         offers = shop_offers.get(channel.id) or []
@@ -4104,6 +4228,64 @@ async def _forward_with_note(channel: discord.TextChannel, note: str) -> None:
     await channel.send(note)
     await db_execute("UPDATE tickets SET awaiting_proof=FALSE WHERE channel_id=$1", channel.id)
     await forward_ticket_flow(channel, None)
+
+
+AI_REPLACEMENT_PROMPT = (
+    "You are the replacement/support assistant for AF SERVICES, a gaming-account shop. The "
+    "customer is in a SUPPORT ticket, usually requesting a replacement. Enforce this policy "
+    "strictly but kindly:\n"
+    + REPLACEMENT_RULES.replace("**", "") + "\n\n"
+    "Decide each turn:\n"
+    "- If they want a REFUND, or their reason is clearly NOT 'the account is invalid or banned' "
+    "(e.g. changed their mind, don't like it, want money back, buyer's remorse): politely explain "
+    "we only replace invalid/banned accounts and don't refund, then set action \"close\".\n"
+    "- If the account is invalid/banned (a valid reason): ask them to upload their proof of "
+    "purchase AND the REQUIRED recording/video (for Full-Access accounts), then set action "
+    "\"await_proof\".\n"
+    "- If you still need more detail, ask for it with action \"none\".\n"
+    "- NEVER promise a replacement yourself — the owner decides after reviewing the video.\n\n"
+    "Respond with ONLY JSON: "
+    '{"reply": "<message>", "action": "none"|"close"|"await_proof", "reason": "<short>"}'
+)
+
+
+async def run_ai_replacement(channel: discord.TextChannel, owner: discord.abc.User) -> None:
+    """Conversational assistant for support/replacement tickets: enforces policy,
+    guides the customer to upload proof, and closes clearly-ineligible requests."""
+    if not (AI_ENABLED and anthropic_client):
+        return
+    history: list[dict] = []
+    async for m in channel.history(limit=25, oldest_first=True):
+        if not m.content:
+            continue
+        role = "assistant" if (bot.user and m.author.id == bot.user.id) else "user"
+        history.append({"role": role, "content": m.content[:1500]})
+    while history and history[0]["role"] != "user":
+        history.pop(0)
+    if not history:
+        return
+    merged: list[dict] = []
+    for h in history:
+        if merged and merged[-1]["role"] == h["role"]:
+            merged[-1]["content"] += "\n" + h["content"]
+        else:
+            merged.append(dict(h))
+    try:
+        resp = await anthropic_client.messages.create(
+            model=AI_MODEL, max_tokens=400, system=AI_REPLACEMENT_PROMPT, messages=merged)
+        raw = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
+    except Exception as e:
+        print("AI replacement error:", e)
+        return
+    data = _extract_json(raw) or {}
+    reply = data.get("reply")
+    if reply:
+        await channel.send(str(reply)[:1900])
+    if str(data.get("action") or "none").lower() == "close":
+        await db_execute("UPDATE tickets SET awaiting_proof=FALSE WHERE channel_id=$1", channel.id)
+        await close_ticket_flow(
+            channel, closed_by="Auto (ineligible per policy)",
+            reason=str(data.get("reason") or "Not eligible for replacement per policy"))
 
 
 async def handle_proof_upload(message: discord.Message, row) -> None:
@@ -4315,8 +4497,30 @@ async def handle_review_post(message: discord.Message) -> None:
     is_plus = bool(_PLUS_REP_RE.search(content))
     is_minus = bool(_MINUS_REP_RE.search(content))
 
-    # Negative review → outreach, and leave everything open so we can help them.
+    # Negative review → only allowed if they actually contacted support via a ticket.
     if is_minus and not is_plus:
+        has_ticket = await db_fetchrow(
+            "SELECT 1 FROM tickets WHERE guild_id=$1 AND owner_id=$2 LIMIT 1",
+            guild.id, member.id)
+        if not has_ticket:
+            # Never opened a ticket → remove the -rep and point them to support first.
+            try:
+                await message.delete()
+            except Exception as e:
+                print("Could not delete -rep message:", e)
+            msg = ("Please open a **support ticket** first so we can look into your problem and "
+                   "see if it's solvable — we'll do our best to make it right. Once support has "
+                   "tried to help, you're welcome to leave your review. 🙏")
+            try:
+                await member.send(embed=discord.Embed(
+                    title="Let's sort this out first", description=msg, color=AF_BLUE))
+            except Exception:
+                # DM closed — post a brief, self-deleting note in the channel instead.
+                try:
+                    await message.channel.send(f"{member.mention} {msg}", delete_after=30)
+                except Exception:
+                    pass
+            return
         await _reply_negative_review(message)
         return
 
@@ -4547,6 +4751,29 @@ async def on_message(message: discord.Message):
                 await run_ai_shopping(message.channel, message.author)
         except Exception as e:
             print("AI shopping failed:", e)
+        finally:
+            ai_locks.discard(message.channel.id)
+
+    # AI replacement: in open "support" tickets, enforce policy and guide the
+    # customer until staff claims it or it's forwarded to the owner.
+    if (
+        AI_ENABLED
+        and row["status"] == "open"
+        and row["kind"] == "support"
+        and row["claimed_by"] is None
+        and not row["forwarded_to_owner"]
+        and not row["ai_disabled"]
+        and is_member
+        and not author_is_staff
+        and message.author.id == int(row["owner_id"])
+        and message.channel.id not in ai_locks
+    ):
+        ai_locks.add(message.channel.id)
+        try:
+            async with message.channel.typing():
+                await run_ai_replacement(message.channel, message.author)
+        except Exception as e:
+            print("AI replacement failed:", e)
         finally:
             ai_locks.discard(message.channel.id)
 
