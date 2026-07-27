@@ -202,13 +202,32 @@ IMAP_HOSTS = {
     "mail.ru": "imap.mail.ru", "internet.ru": "imap.mail.ru", "bk.ru": "imap.mail.ru",
     "inbox.ru": "imap.mail.ru", "list.ru": "imap.mail.ru",
     "gmx.com": "imap.gmx.com", "gmx.net": "imap.gmx.net", "gmx.de": "imap.gmx.net", "gmx.us": "imap.gmx.com",
+    # Outlook / Microsoft (note: consumer accounts often need an app password for IMAP).
     "outlook.com": "outlook.office365.com", "hotmail.com": "outlook.office365.com",
-    "live.com": "outlook.office365.com",
+    "live.com": "outlook.office365.com", "hotmail.co.uk": "outlook.office365.com",
+    "outlook.fr": "outlook.office365.com", "outlook.de": "outlook.office365.com",
     "gmail.com": "imap.gmail.com", "googlemail.com": "imap.gmail.com",
+    # Firstmail — many resold domains all route through imap.firstmail.ltd.
     "firstmail.ltd": "imap.firstmail.ltd", "firstmail.com": "imap.firstmail.ltd",
-    "fmailler.com": "imap.firstmail.ltd", "dfirstmail.com": "imap.firstmail.ltd",
+    "fmailler.com": "imap.firstmail.ltd", "fmailler.ltd": "imap.firstmail.ltd",
+    "dfirstmail.com": "imap.firstmail.ltd", "firstmail.co": "imap.firstmail.ltd",
+    "vfirstmail.com": "imap.firstmail.ltd", "sfirstmail.com": "imap.firstmail.ltd",
+    # Notletters.
+    "notletters.com": "imap.notletters.com", "notletters.net": "imap.notletters.com",
     "yahoo.com": "imap.mail.yahoo.com",
 }
+# Any domains containing these substrings map to the given IMAP host (catch-all for
+# providers that sell mailboxes across many random domains, e.g. Firstmail).
+IMAP_HOST_SUBSTR = {
+    "firstmail": "imap.firstmail.ltd",
+    "notletters": "imap.notletters.com",
+}
+# Extra domain→host mappings from env, e.g. IMAP_EXTRA_HOSTS="dom1.com=imap.x.com,dom2.io=mail.y.io"
+for _pair in os.getenv("IMAP_EXTRA_HOSTS", "").split(","):
+    if "=" in _pair:
+        _d, _h = _pair.split("=", 1)
+        if _d.strip() and _h.strip():
+            IMAP_HOSTS[_d.strip().lower()] = _h.strip()
 
 # --- NowPayments (crypto checkout for custom orders) ---
 NOWPAYMENTS_API_KEY = os.getenv("NOWPAYMENTS_API_KEY", "")
@@ -1401,7 +1420,12 @@ async def lzt_get_credentials(item_id: str | int) -> dict:
 # ============================================================
 def _imap_host_for(address: str) -> str:
     domain = address.split("@")[-1].strip().lower()
-    return IMAP_HOSTS.get(domain) or IMAP_HOST_DEFAULT or f"imap.{domain}"
+    if domain in IMAP_HOSTS:
+        return IMAP_HOSTS[domain]
+    for needle, host in IMAP_HOST_SUBSTR.items():
+        if needle in domain:
+            return host
+    return IMAP_HOST_DEFAULT or f"imap.{domain}"
 
 
 def _decode_mime_header(value: str | None) -> str:
@@ -1542,7 +1566,13 @@ EMAIL_PROVIDERS = {
     "gmail.com": ("Gmail", "https://mail.google.com"),
     "firstmail.ltd": ("Firstmail", "https://firstmail.ltd"),
     "firstmail.com": ("Firstmail", "https://firstmail.ltd"),
+    "notletters.com": ("Notletters", "https://notletters.com"),
     "yahoo.com": ("Yahoo", "https://mail.yahoo.com"),
+}
+# Substring → (provider name, webmail) for the guide, matching many resold domains.
+EMAIL_PROVIDER_SUBSTR = {
+    "firstmail": ("Firstmail", "https://firstmail.ltd"),
+    "notletters": ("Notletters", "https://notletters.com"),
 }
 
 
@@ -1550,6 +1580,9 @@ def _email_provider(address: str) -> tuple[str, str | None]:
     domain = (address or "").split("@")[-1].strip().lower()
     if domain in EMAIL_PROVIDERS:
         return EMAIL_PROVIDERS[domain]
+    for needle, info in EMAIL_PROVIDER_SUBSTR.items():
+        if needle in domain:
+            return info
     return (domain or "Email", None)
 
 
