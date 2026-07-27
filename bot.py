@@ -806,12 +806,15 @@ async def _resolve_valorant_skins(item: dict) -> list[str]:
 # Candidate LZT keys per cosmetic type; each entry is a dict with a title (like
 # fortniteSkins) or a plain string. We probe several names defensively.
 _FN_COSMETIC_KEYS: dict[str, list[str]] = {
-    "Skins":       ["fortniteSkins", "fortnite_skins"],
+    "Skins":       ["fortniteSkins", "fortnite_skins", "fortniteOutfits", "fortnite_outfits"],
     "Pickaxes":    ["fortnitePickaxes", "fortnitePickaxe", "fortnite_pickaxes",
-                    "fortniteHarvestingTools", "fortnitePickaxes_list"],
-    "Emotes":      ["fortniteDances", "fortniteEmotes", "fortnite_dances", "fortnite_emotes"],
+                    "fortniteHarvestingTools", "fortnite_harvesting_tools",
+                    "fortnitePickaxes_list", "fortnitePickaxeList"],
+    "Emotes":      ["fortniteDances", "fortniteEmotes", "fortnite_dances", "fortnite_emotes",
+                    "fortniteEmote"],
     "Gliders":     ["fortniteGliders", "fortniteGlider", "fortnite_gliders"],
-    "Back Blings": ["fortniteBackpacks", "fortniteBackblings", "fortnite_backpacks"],
+    "Back Blings": ["fortniteBackpacks", "fortniteBackblings", "fortnite_backpacks",
+                    "fortniteBackBlings"],
 }
 
 
@@ -930,17 +933,20 @@ def _steam_game_names(item: dict) -> list[str]:
 
 async def _searchable_names(game: str, item: dict) -> list[str]:
     """Names to match a customer's request against, per game:
-    Valorant/Fortnite → cosmetics; Steam → game titles; anything else → the title."""
+    Valorant/Fortnite → cosmetics; Steam → game titles; anything else → the title.
+    The listing title is always appended — LZT titles often name rare items
+    (e.g. "…Axe of Champions…"), so we still match when the cosmetic list is thin."""
     g = (game or "").lower()
+    names: list[str] = []
     if g in ("valorant", "fortnite"):
         sections = await build_cosmetic_sections(g, item)
-        return [n for names in sections.values() for n in names]
-    if g in ("steam",):
+        names = [n for grp in sections.values() for n in grp]
+    elif g in ("steam",):
         names = _steam_game_names(item)
-        if names:
-            return names
     title = item.get("title") or item.get("title_en") or ""
-    return [str(title)] if title else []
+    if title:
+        names.append(str(title))
+    return names
 
 
 _REGION_ALIASES = {
@@ -2992,7 +2998,7 @@ async def market_command(interaction: discord.Interaction, category: app_command
 
     # When filtering we scan a bigger pool; a specific request pulls cheapest-first.
     specific = bool(wanted or region)
-    pool = MARKET_MAX_SCAN if specific else count
+    pool = MARKET_SCAN_DEEP if specific else count
     res = await lzt_search_market(category.value, budget=budget, count=count, pool=pool,
                                   cheapest=specific)
     if not res["ok"]:
@@ -3004,23 +3010,8 @@ async def market_command(interaction: discord.Interaction, category: app_command
             + (f" under €{budget:.0f}." if budget else "."), ephemeral=True)
         return
 
-    # Pull details (needed for skin lists + rich rendering); keep matches until we
-    # have `count`, bounded by MARKET_MAX_SCAN so we never hammer the API.
-    chosen: list[dict] = []
-    scanned = 0
-    for it in res["items"]:
-        if len(chosen) >= count or scanned >= MARKET_MAX_SCAN:
-            break
-        det = await lzt_item_detail(it.get("item_id") or it.get("id"))
-        scanned += 1
-        item = det["item"] if det["ok"] else it
-        if region and not _region_matches(item, region):
-            continue
-        if wanted:
-            owned = [n.lower() for n in await _searchable_names(category.value, item)]
-            if not all(_cosmetic_matches(owned, w) for w in wanted):
-                continue
-        chosen.append(item)
+    # Scan deeply and rank: full matches first (cheapest), else best partial matches.
+    chosen, full_match = await scan_and_rank(category.value, res["items"], wanted, region, count)
 
     cosmetic_game = category.value in ("valorant", "fortnite")
     if not chosen:
@@ -3033,6 +3024,7 @@ async def market_command(interaction: discord.Interaction, category: app_command
             msg += f" under €{budget:.0f}"
         await interaction.followup.send(msg + ".", ephemeral=True)
         return
+    partial = bool(wanted) and not full_match
 
     embeds, files = [], []
     for i, item in enumerate(chosen):
@@ -3041,7 +3033,9 @@ async def market_command(interaction: discord.Interaction, category: app_command
         if file:
             files.append(file)
 
-    if specific:
+    if partial:
+        header = f"🛍️ **{category.name} accounts** — closest matches (no single account had everything)"
+    elif specific:
         header = f"🛍️ **{category.name} accounts** — cheapest match first"
     elif category.value == "valorant":
         header = f"🛍️ **{category.name} accounts available** — highest **VP spent** first"
@@ -4259,33 +4253,62 @@ async def post_card_checkout(channel: discord.TextChannel, account_price: float)
     await channel.send(embed=e)
 
 
-async def present_accounts(channel: discord.TextChannel, game: str, budget: float | None,
-                           wanted: list[str], count: int = 3, region: str | None = None) -> int:
-    """Search, filter, and post matching accounts; remember them for selection.
-    A specific request (named item/region) is shown cheapest-first. Returns count shown."""
-    region = (region or "").strip().lower() or None
-    specific = bool(wanted or region)
-    pool = 20 if specific else count
-    res = await lzt_search_market(game, budget=budget, count=count, pool=pool, cheapest=specific)
-    if not res["ok"]:
-        await channel.send(f"⚠️ I couldn't reach the stock right now (`{res['error']}`). "
-                           f"A staff member will help you shortly.")
-        return 0
-    chosen: list[dict] = []
+MARKET_SCAN_DEEP = 40  # how many listings to inspect when filtering a specific request
+
+
+async def scan_and_rank(game: str, items: list[dict], wanted: list[str],
+                        region: str | None, count: int,
+                        max_scan: int = MARKET_SCAN_DEEP) -> tuple[list[dict], bool]:
+    """Scan listings (fetching detail), scoring by how many requested items each has.
+    Returns (chosen, full_match): FULL matches (all requested items) first, cheapest;
+    if none has everything, the best PARTIAL matches (most items, then cheapest)."""
+    scored: list[tuple[int, float, dict]] = []
     scanned = 0
-    for it in res["items"]:
-        if len(chosen) >= count or scanned >= 20:
+    need = len(wanted)
+    for it in items:
+        if scanned >= max_scan:
             break
         det = await lzt_item_detail(it.get("item_id") or it.get("id"))
         scanned += 1
         item = det["item"] if det["ok"] else it
         if region and not _region_matches(item, region):
             continue
+        mc = 0
         if wanted:
             owned = [n.lower() for n in await _searchable_names(game, item)]
-            if not all(_cosmetic_matches(owned, w) for w in wanted):
+            mc = sum(1 for w in wanted if _cosmetic_matches(owned, w))
+            if mc == 0:
                 continue
-        chosen.append(item)
+        _, price = _resale_price(item)
+        scored.append((mc, price, item))
+        # Stop early once we have enough FULL matches (or enough items with no filter).
+        if wanted and sum(1 for s in scored if s[0] == need) >= count:
+            break
+        if not wanted and len(scored) >= count:
+            break
+    if not scored:
+        return [], False
+    if wanted:
+        full = [s for s in scored if s[0] == need]
+        pool = full if full else scored
+        pool.sort(key=lambda s: (-s[0], s[1]))  # most items matched, then cheapest
+        return [s[2] for s in pool[:count]], bool(full)
+    return [s[2] for s in scored[:count]], True
+
+
+async def present_accounts(channel: discord.TextChannel, game: str, budget: float | None,
+                           wanted: list[str], count: int = 3, region: str | None = None) -> int:
+    """Search, filter, and post matching accounts; remember them for selection.
+    A specific request (named item/region) is shown cheapest-first. Returns count shown."""
+    region = (region or "").strip().lower() or None
+    specific = bool(wanted or region)
+    pool = MARKET_SCAN_DEEP if specific else count
+    res = await lzt_search_market(game, budget=budget, count=count, pool=pool, cheapest=specific)
+    if not res["ok"]:
+        await channel.send(f"⚠️ I couldn't reach the stock right now (`{res['error']}`). "
+                           f"A staff member will help you shortly.")
+        return 0
+    chosen, full_match = await scan_and_rank(game, res["items"], wanted, region, count)
     if not chosen:
         bits = []
         if wanted:
@@ -4297,6 +4320,7 @@ async def present_accounts(channel: discord.TextChannel, game: str, budget: floa
             f"I couldn't find a {game_label(game)} account{extra} within that budget right now. "
             f"Try a higher budget, or a staff member can source one for you.")
         return 0
+    partial = bool(wanted) and not full_match
 
     embeds, files, offers = [], [], []
     for i, item in enumerate(chosen):
@@ -4312,7 +4336,13 @@ async def present_accounts(channel: discord.TextChannel, game: str, budget: floa
     shop_offers[channel.id] = offers
 
     view = skins_view_for(chosen, game) if game in ("valorant", "fortnite") else None
-    lead = "Here are the cheapest matches 👇" if specific else "Here are the best matches 👇"
+    if partial:
+        lead = ("I couldn't find one account with **everything** you asked for within budget, so "
+                "here are the **closest matches** (cheapest first) 👇")
+    elif specific:
+        lead = "Here are the cheapest matches 👇"
+    else:
+        lead = "Here are the best matches 👇"
     kwargs = {
         "content": f"{lead} Reply with the **number** of the one you want, "
                    "or ask me to adjust the budget.",
