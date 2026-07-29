@@ -1466,9 +1466,40 @@ def _email_body_text(msg) -> str:
     return body
 
 
+_CODE_KEYWORDS = ("code", "verification", "verify", "confirm", "otp", "one-time",
+                  "one time", "security", "passcode", "pin", "access code", "auth",
+                  "код", "подтвержд")  # incl. RU for rambler/mail.ru
+
+
 def _find_verification_code(text: str) -> str | None:
-    m = re.search(r"\b(\d{4,8})\b", text or "")
-    return m.group(1) if m else None
+    """Best-effort verification code: prefer a 4-8 char code that sits near a
+    'code/verification/OTP' keyword; avoid years and unrelated long numbers."""
+    if not text:
+        return None
+    low = text.lower()
+    best = None  # (score, position, code)
+    # Numeric codes, possibly grouped like 123-456 or 123 456. Bounded by non-digits
+    # only (so a trailing period / end-of-sentence doesn't reject the code).
+    for m in re.finditer(r"(?<!\d)(\d[\d \-]{2,9}\d)(?!\d)", text):
+        digits = re.sub(r"\D", "", m.group(1))
+        if not (4 <= len(digits) <= 8):
+            continue
+        score = {6: 4, 8: 3, 5: 2, 4: 1, 7: 1}.get(len(digits), 0)
+        if len(digits) == 4 and 1900 <= int(digits) <= 2099:
+            score -= 4  # looks like a year
+        window = low[max(0, m.start() - 45):m.start()]
+        if any(k in window for k in _CODE_KEYWORDS):
+            score += 6
+        cand = (score, m.start(), digits)
+        if best is None or cand[0] > best[0] or (cand[0] == best[0] and cand[1] < best[1]):
+            best = cand
+    if best and best[0] > 0:
+        return best[2]
+    # Fallback: an alphanumeric token right after a code keyword (e.g. "code: A1B2C3").
+    m = re.search(r"(?:code|otp|passcode|pin|код)\W{0,10}([A-Z0-9]{4,8})\b", text, re.IGNORECASE)
+    if m:
+        return m.group(1).upper()
+    return best[2] if best else None
 
 
 def _fetch_emails_sync(host: str, address: str, password: str, limit: int) -> dict:
@@ -3176,9 +3207,8 @@ async def restock_command(interaction: discord.Interaction, item_id: str):
 
 
 @bot.tree.command(name="email",
-                  description="Read email letters / verification codes — paste email:pass or an item ID (staff).")
-@staff_only()
-@app_commands.describe(account="email:pass  (e.g. bob@rambler.ru:pass123)  OR an account item ID",
+                  description="Read email letters / verification codes — paste your email:pass (or item ID for staff).")
+@app_commands.describe(account="Your email:pass  (e.g. bob@rambler.ru:pass123)  — or an account item ID (staff)",
                        count="How many letters (1-30)")
 async def email_command(interaction: discord.Interaction, account: str, count: int = 10):
     if not EMAIL_LETTERS_ENABLED:
@@ -3191,13 +3221,20 @@ async def email_command(interaction: discord.Interaction, account: str, count: i
     password_for_refresh: str | None = None
 
     if "@" in acc and ":" in acc:
-        # email:pass  (password may itself contain ':' → split on the first colon only)
+        # email:pass — anyone can read an inbox they already have the creds for.
+        # (password may itself contain ':' → split on the first colon only)
         address, _, password = acc.partition(":")
         address, password = address.strip(), password.strip()
         password_for_refresh = password
         res = await read_inbox(address, password, limit=limit)
     else:
-        # treat as an account item ID
+        # Item-ID lookup pulls creds from stock → staff only (don't let anyone
+        # read arbitrary accounts' inboxes by guessing IDs).
+        if not (isinstance(interaction.user, discord.Member) and is_staff(interaction.user)):
+            await interaction.followup.send(
+                "Paste your **email:pass** (e.g. `bob@rambler.ru:pass123`) to read your letters. "
+                "Reading by item ID is staff-only.", ephemeral=True)
+            return
         res = await fetch_account_emails(acc, limit=limit)
         item_id_for_refresh = int(re.sub(r"[^0-9]", "", acc) or 0) or None
 
